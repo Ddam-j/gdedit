@@ -31,6 +31,32 @@ These features enhance the experience but are not required. gdedit detects them 
 
 The editor is designed to work without these. If your terminal does not support a particular feature, the core editing experience remains intact.
 
+## Key Delivery Notes
+
+Terminal key delivery is not uniform. `gdedit` treats some shortcuts as best-effort aliases only when the terminal forwards them reliably.
+
+| Key | Reliability | Current Role |
+|-----|-------------|--------------|
+| `F1` | High | Help dialog |
+| `F2` | High | Hierarchical block selection |
+| `Ctrl+C` | High | Quit confirmation |
+| `Alt+.` / `Alt+,` | Medium to high | Primary tab navigation |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Low | Best-effort tab navigation alias |
+| `Ctrl+[` | Low | Best-effort block-selection alias; often delivered as `Esc` |
+| `Ctrl+Space` | Low | Best-effort block-selection alias; often dropped |
+
+When terminal behavior is inconsistent, gdedit prefers keys that arrive predictably rather than desktop-editor conventions that are frequently swallowed by tmux, ssh, or terminal emulators.
+
+## Visible Tab Policy
+
+`gdedit` does not currently treat literal tab characters as layout-width cells. Instead:
+
+- literal `\t` is stored in the buffer
+- literal `\t` is rendered as a visible `»` marker with distinct styling
+- selection indentation is handled separately through configurable indentation units
+
+This keeps storage and display separate, avoids cursor-width ambiguity, and makes tab characters auditable inside a terminal-first editor.
+
 ## Supported Terminals
 
 The following terminals are tested and known to work well with gdedit. Other modern terminals with the required capabilities may work but are not explicitly tested.

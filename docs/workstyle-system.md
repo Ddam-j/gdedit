@@ -41,6 +41,7 @@ A workstyle may bundle:
 - preferred shortcuts
 - mnemonic vs modal emphasis
 - navigation rhythm
+- terminal-safe fallback priorities when classic desktop shortcuts do not survive terminal transport
 
 ### Panel / Layout Habits
 
@@ -106,6 +107,12 @@ That means a workstyle expresses:
 - uses layout as part of the method
 - pairs well with terminal split workflows later
 
+### Terminal-Safe Editing Style
+
+- prefers predictable keys such as function keys or `Alt`-modified runes over desktop-only shortcut assumptions
+- treats best-effort aliases as optional, not canonical
+- separates storage characters from rendered markers when the terminal cannot faithfully represent width-sensitive text
+
 ## Shareability
 
 A workstyle should be shareable as a package, not just exported as raw keybindings.
@@ -162,6 +169,8 @@ Recommendations should be:
 - clearly framed as suggestions
 - easy to dismiss
 - grounded in observed editing behavior
+
+For terminal-first workstyles, recommendations should also preserve transport reliability. A shortcut that looks elegant on paper but fails in tmux or ssh should not be promoted as the default style.
 
 ## Relationship to Other Systems
 

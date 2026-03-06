@@ -2,14 +2,17 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
 )
 
 const (
-	minWidth  = 60
-	minHeight = 12
+	minWidth      = 60
+	minHeight     = 12
+	defaultIndent = 2
+	tabGlyph      = "»"
 )
 
 type focusArea int
@@ -20,9 +23,12 @@ const (
 )
 
 type Tab struct {
-	Title   string
-	Content []string
-	Locked  map[int]bool
+	Title           string
+	Content         []string
+	Locked          map[int]bool
+	CursorX         int
+	CursorY         int
+	SelectionAnchor int
 }
 
 type handoffState string
@@ -42,23 +48,31 @@ type reviewItem struct {
 	State  handoffState
 }
 
+type lineRange struct {
+	start int
+	end   int
+}
+
 type App struct {
-	screen        tcell.Screen
-	tabs          []Tab
-	activeTab     int
-	focus         focusArea
-	controlInput  []rune
-	controlCursor int
-	preview       Preview
-	cursorX       int
-	cursorY       int
-	selectionOn   bool
-	statusMessage string
-	voiceState    string
-	reviewCount   int
-	handoff       handoffState
-	reviewItems   []reviewItem
-	lastApplied   string
+	screen          tcell.Screen
+	tabs            []Tab
+	activeTab       int
+	focus           focusArea
+	controlInput    []rune
+	controlCursor   int
+	preview         Preview
+	cursorX         int
+	cursorY         int
+	selectionAnchor int
+	statusMessage   string
+	voiceState      string
+	reviewCount     int
+	handoff         handoffState
+	reviewItems     []reviewItem
+	lastApplied     string
+	helpVisible     bool
+	quitConfirm     bool
+	indentWidth     int
 }
 
 func New() *App {
@@ -69,39 +83,65 @@ func New() *App {
 				Content: []string{
 					"package main",
 					"",
-					"func main() {",
-					"	// Phase 5 shell placeholder",
-					"	println(\"gdedit\")",
+					"func route(input string) string {",
+					"\tif input == \"agent\" {",
+					"		return buildReply(input)",
+					"	}",
+					"	return fallback(input)",
 					"}",
 				},
-				Locked: map[int]bool{0: true, 2: true},
+				Locked:          map[int]bool{0: true, 2: true},
+				SelectionAnchor: -1,
 			},
 			{
-				Title: "review.diff",
+				Title: "worker.py",
 				Content: []string{
-					"@@ preview",
-					"- old line",
-					"+ proposed line",
-					"",
-					"Use the control hub to inspect or hold proposals.",
+					"def transform(task):",
+					"    if task.ready:",
+					"        for step in task.steps:",
+					"            if step.enabled:",
+					"                return step.name",
+					"    return \"idle\"",
 				},
-				Locked: map[int]bool{0: true},
+				Locked:          map[int]bool{0: true},
+				SelectionAnchor: -1,
 			},
 			{
-				Title: "notes.md",
+				Title: "panel.ts",
 				Content: []string{
-					"- One control hub",
-					"- Multiple edit tabs",
-					"- Voice flows into control",
-					"- Preview before apply",
+					"export function buildPanel(state: EditorState) {",
+					"  if (state.mode === \"review\") {",
+					"    return {",
+					"      title: \"Review Queue\",",
+					"      items: state.items.map((item) => item.label),",
+					"    }",
+					"  }",
+					"  return { title: \"Editor\", items: [] }",
+					"}",
 				},
-				Locked: map[int]bool{},
+				Locked:          map[int]bool{0: true},
+				SelectionAnchor: -1,
+			},
+			{
+				Title: "config.yaml",
+				Content: []string{
+					"workstyle:",
+					"  name: focused-review",
+					"  shortcuts:",
+					"    select_block: ctrl-[",
+					"    move_block_up: ctrl-up",
+					"    move_block_down: ctrl-down",
+				},
+				Locked:          map[int]bool{0: true},
+				SelectionAnchor: -1,
 			},
 		},
-		focus:         focusEditor,
-		statusMessage: "Ready. Ctrl+G focuses the control hub.",
-		voiceState:    "off",
-		handoff:       handoffHumanLed,
+		focus:           focusEditor,
+		selectionAnchor: -1,
+		statusMessage:   "Ready. Ctrl+G focuses the control hub.",
+		voiceState:      "off",
+		handoff:         handoffHumanLed,
+		indentWidth:     defaultIndent,
 	}
 }
 
@@ -143,7 +183,46 @@ func (a *App) Run() (err error) {
 
 func (a *App) handleKey(ev *tcell.EventKey) bool {
 	if ev.Key() == tcell.KeyCtrlC {
-		return true
+		a.quitConfirm = true
+		a.statusMessage = "Quit confirmation opened. Press Enter or y to exit, Esc or n to stay."
+		return false
+	}
+
+	if ev.Key() == tcell.KeyF1 {
+		a.helpVisible = true
+		a.quitConfirm = false
+		a.statusMessage = "Help opened. Press Esc to close."
+		return false
+	}
+
+	if a.quitConfirm {
+		switch ev.Key() {
+		case tcell.KeyEsc:
+			a.quitConfirm = false
+			a.statusMessage = "Quit cancelled."
+			return false
+		case tcell.KeyEnter:
+			return true
+		case tcell.KeyRune:
+			switch ev.Rune() {
+			case 'y', 'Y':
+				return true
+			case 'n', 'N':
+				a.quitConfirm = false
+				a.statusMessage = "Quit cancelled."
+				return false
+			}
+		}
+		return false
+	}
+
+	if a.helpVisible {
+		if ev.Key() == tcell.KeyEsc {
+			a.helpVisible = false
+			a.statusMessage = "Help closed."
+			return false
+		}
+		return false
 	}
 
 	switch a.focus {
@@ -165,45 +244,265 @@ func (a *App) handleEditorKey(ev *tcell.EventKey) bool {
 		a.statusMessage = "Control hub focused. Type a command and press Enter for preview."
 		return false
 	case tcell.KeyTab:
-		a.nextTab()
+		if ev.Modifiers()&tcell.ModCtrl != 0 {
+			a.nextTab()
+		} else if a.hasSelection() {
+			a.indentSelection()
+		} else {
+			a.insertRune('\t')
+		}
 		return false
 	case tcell.KeyBacktab:
-		a.prevTab()
+		if ev.Modifiers()&tcell.ModCtrl != 0 {
+			a.prevTab()
+		} else {
+			a.outdentSelection()
+		}
+		return false
+	case tcell.KeyF2, tcell.KeyCtrlLeftSq, tcell.KeyCtrlSpace:
+		a.selectCodeBlock()
+		return false
+	case tcell.KeyEsc:
+		if a.hasSelection() {
+			a.clearSelection("Selection cleared.")
+		}
 		return false
 	case tcell.KeyUp:
+		if ev.Modifiers()&tcell.ModCtrl != 0 {
+			a.moveSelectedBlock(-1)
+			return false
+		}
+		if ev.Modifiers()&(tcell.ModAlt|tcell.ModShift) != 0 {
+			a.expandSelection(-1)
+			return false
+		}
 		a.cursorY--
 	case tcell.KeyDown:
+		if ev.Modifiers()&tcell.ModCtrl != 0 {
+			a.moveSelectedBlock(1)
+			return false
+		}
+		if ev.Modifiers()&(tcell.ModAlt|tcell.ModShift) != 0 {
+			a.expandSelection(1)
+			return false
+		}
 		a.cursorY++
 	case tcell.KeyLeft:
 		a.cursorX--
 	case tcell.KeyRight:
 		a.cursorX++
+	case tcell.KeyEnter:
+		a.insertNewLine()
+		return false
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		a.backspaceEditor()
+		return false
+	case tcell.KeyDelete:
+		a.deleteEditor()
+		return false
 	case tcell.KeyRune:
-		switch ev.Rune() {
-		case 'q':
-			return true
-		case 'v':
-			a.selectionOn = !a.selectionOn
-			if a.selectionOn {
-				a.statusMessage = "Selection enabled for current cursor line."
-			} else {
-				a.statusMessage = "Selection cleared."
+		if ev.Modifiers()&tcell.ModAlt != 0 {
+			switch ev.Rune() {
+			case '.':
+				a.nextTab()
+				return false
+			case ',':
+				a.prevTab()
+				return false
+			case '0', '1', '2', '3', '4':
+				a.setIndentWidth(int(ev.Rune() - '0'))
+				return false
 			}
-			a.handoff = handoffHumanLed
-		case ']':
-			a.nextTab()
-		case '[':
-			a.prevTab()
-		case ':':
-			a.focus = focusControl
-			a.voiceState = "ready"
-			a.handoff = handoffAgentSuggest
-			a.statusMessage = "Control hub focused from editor shortcut."
 		}
+		a.insertRune(ev.Rune())
+		return false
 	}
 
 	a.ensureCursorInBounds()
 	return false
+}
+
+func (a *App) insertRune(r rune) {
+	if a.currentLineLocked() {
+		a.handoff = handoffDenied
+		a.statusMessage = "Current line is locked and cannot be edited directly."
+		return
+	}
+
+	line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
+	if a.cursorX < 0 {
+		a.cursorX = 0
+	}
+	if a.cursorX > len(line) {
+		a.cursorX = len(line)
+	}
+
+	line = append(line[:a.cursorX], append([]rune{r}, line[a.cursorX:]...)...)
+	a.tabs[a.activeTab].Content[a.cursorY] = string(line)
+	a.cursorX++
+	a.handoff = handoffHumanLed
+	a.statusMessage = "Inserted text in active edit surface."
+}
+
+func (a *App) insertString(text string) {
+	for _, r := range []rune(text) {
+		a.insertRune(r)
+	}
+}
+
+func (a *App) indentUnit() string {
+	if a.indentWidth == 0 {
+		return "\t"
+	}
+	return strings.Repeat(" ", a.indentWidth)
+}
+
+func (a *App) setIndentWidth(width int) {
+	if width < 0 {
+		width = 0
+	}
+	if width > 8 {
+		width = 8
+	}
+	a.indentWidth = width
+	if width == 0 {
+		a.statusMessage = "Indentation mode set to literal tabs."
+		return
+	}
+	a.statusMessage = fmt.Sprintf("Indent width set to %d spaces.", width)
+}
+
+func (a *App) indentModeLabel() string {
+	if a.indentWidth == 0 {
+		return "tabs"
+	}
+	return fmt.Sprintf("spaces-%d", a.indentWidth)
+}
+
+func (a *App) insertNewLine() {
+	if a.currentLineLocked() {
+		a.handoff = handoffDenied
+		a.statusMessage = "Current line is locked and cannot be split."
+		return
+	}
+
+	line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
+	if a.cursorX < 0 {
+		a.cursorX = 0
+	}
+	if a.cursorX > len(line) {
+		a.cursorX = len(line)
+	}
+
+	before := string(line[:a.cursorX])
+	after := string(line[a.cursorX:])
+	content := a.tabs[a.activeTab].Content
+	updated := make([]string, 0, len(content)+1)
+	updated = append(updated, content[:a.cursorY]...)
+	updated = append(updated, before, after)
+	updated = append(updated, content[a.cursorY+1:]...)
+	a.tabs[a.activeTab].Content = updated
+	a.shiftLockedLines(a.cursorY+1, 1)
+	a.cursorY++
+	a.cursorX = 0
+	a.handoff = handoffHumanLed
+	a.statusMessage = "Inserted a new line."
+}
+
+func (a *App) backspaceEditor() {
+	if a.currentLineLocked() {
+		a.handoff = handoffDenied
+		a.statusMessage = "Current line is locked and cannot be edited directly."
+		return
+	}
+
+	if a.cursorX > 0 {
+		line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
+		line = append(line[:a.cursorX-1], line[a.cursorX:]...)
+		a.tabs[a.activeTab].Content[a.cursorY] = string(line)
+		a.cursorX--
+		a.handoff = handoffHumanLed
+		a.statusMessage = "Deleted previous character."
+		return
+	}
+
+	if a.cursorY == 0 {
+		return
+	}
+
+	prevIndex := a.cursorY - 1
+	locked := a.tabs[a.activeTab].Locked
+	if locked != nil && locked[prevIndex] {
+		a.handoff = handoffDenied
+		a.statusMessage = "Previous line is locked and cannot be merged."
+		return
+	}
+
+	prev := a.tabs[a.activeTab].Content[prevIndex]
+	current := a.tabs[a.activeTab].Content[a.cursorY]
+	a.tabs[a.activeTab].Content[prevIndex] = prev + current
+	a.tabs[a.activeTab].Content = append(a.tabs[a.activeTab].Content[:a.cursorY], a.tabs[a.activeTab].Content[a.cursorY+1:]...)
+	a.shiftLockedLines(a.cursorY, -1)
+	a.cursorY = prevIndex
+	a.cursorX = len([]rune(prev))
+	a.handoff = handoffHumanLed
+	a.statusMessage = "Merged the current line into the previous line."
+}
+
+func (a *App) deleteEditor() {
+	if a.currentLineLocked() {
+		a.handoff = handoffDenied
+		a.statusMessage = "Current line is locked and cannot be edited directly."
+		return
+	}
+
+	line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
+	if a.cursorX < len(line) {
+		line = append(line[:a.cursorX], line[a.cursorX+1:]...)
+		a.tabs[a.activeTab].Content[a.cursorY] = string(line)
+		a.handoff = handoffHumanLed
+		a.statusMessage = "Deleted character at cursor."
+		return
+	}
+
+	if a.cursorY >= len(a.tabs[a.activeTab].Content)-1 {
+		return
+	}
+
+	nextIndex := a.cursorY + 1
+	locked := a.tabs[a.activeTab].Locked
+	if locked != nil && locked[nextIndex] {
+		a.handoff = handoffDenied
+		a.statusMessage = "Next line is locked and cannot be merged."
+		return
+	}
+
+	next := a.tabs[a.activeTab].Content[nextIndex]
+	a.tabs[a.activeTab].Content[a.cursorY] = a.tabs[a.activeTab].Content[a.cursorY] + next
+	a.tabs[a.activeTab].Content = append(a.tabs[a.activeTab].Content[:nextIndex], a.tabs[a.activeTab].Content[nextIndex+1:]...)
+	a.shiftLockedLines(nextIndex, -1)
+	a.handoff = handoffHumanLed
+	a.statusMessage = "Merged the next line into the current line."
+}
+
+func (a *App) shiftLockedLines(fromIndex, delta int) {
+	locked := a.tabs[a.activeTab].Locked
+	if locked == nil || delta == 0 {
+		return
+	}
+
+	updated := make(map[int]bool, len(locked))
+	for index, value := range locked {
+		if !value {
+			continue
+		}
+		if index >= fromIndex {
+			updated[index+delta] = value
+		} else {
+			updated[index] = value
+		}
+	}
+	a.tabs[a.activeTab].Locked = updated
 }
 
 func (a *App) handleControlKey(ev *tcell.EventKey) bool {
@@ -292,9 +591,6 @@ func (a *App) handleControlKey(ev *tcell.EventKey) bool {
 		return false
 	case tcell.KeyRune:
 		r := ev.Rune()
-		if r == 'q' && len(a.controlInput) == 0 && !a.preview.Pending {
-			return true
-		}
 		a.controlInput = append(a.controlInput[:a.controlCursor], append([]rune{r}, a.controlInput[a.controlCursor:]...)...)
 		a.controlCursor++
 		a.preview = Preview{}
@@ -309,25 +605,536 @@ func (a *App) handleControlKey(ev *tcell.EventKey) bool {
 }
 
 func (a *App) nextTab() {
+	a.saveCurrentTabState()
 	a.activeTab = (a.activeTab + 1) % len(a.tabs)
-	a.ensureCursorInBounds()
+	a.loadCurrentTabState()
 	a.statusMessage = "Switched to tab " + a.tabs[a.activeTab].Title
 }
 
 func (a *App) prevTab() {
+	a.saveCurrentTabState()
 	a.activeTab--
 	if a.activeTab < 0 {
 		a.activeTab = len(a.tabs) - 1
 	}
-	a.ensureCursorInBounds()
+	a.loadCurrentTabState()
 	a.statusMessage = "Switched to tab " + a.tabs[a.activeTab].Title
 }
 
+func (a *App) saveCurrentTabState() {
+	if len(a.tabs) == 0 || a.activeTab < 0 || a.activeTab >= len(a.tabs) {
+		return
+	}
+	tab := &a.tabs[a.activeTab]
+	tab.CursorX = a.cursorX
+	tab.CursorY = a.cursorY
+	tab.SelectionAnchor = a.selectionAnchor
+}
+
+func (a *App) loadCurrentTabState() {
+	if len(a.tabs) == 0 || a.activeTab < 0 || a.activeTab >= len(a.tabs) {
+		return
+	}
+	tab := &a.tabs[a.activeTab]
+	a.cursorX = tab.CursorX
+	a.cursorY = tab.CursorY
+	a.selectionAnchor = tab.SelectionAnchor
+	a.ensureCursorInBounds()
+	tab.CursorX = a.cursorX
+	tab.CursorY = a.cursorY
+	tab.SelectionAnchor = a.selectionAnchor
+}
+
 func (a *App) currentScope() string {
-	if a.selectionOn {
-		return fmt.Sprintf("selection:L%d", a.cursorY+1)
+	if start, end, ok := a.selectionRange(); ok {
+		if start == end {
+			return fmt.Sprintf("selection:L%d", start+1)
+		}
+		return fmt.Sprintf("selection:L%d-L%d", start+1, end+1)
 	}
 	return fmt.Sprintf("cursor:L%d:C%d", a.cursorY+1, a.cursorX+1)
+}
+
+func (a *App) hasSelection() bool {
+	return a.selectionAnchor >= 0
+}
+
+func (a *App) selectionRange() (int, int, bool) {
+	if !a.hasSelection() {
+		return 0, 0, false
+	}
+	start := a.selectionAnchor
+	end := a.cursorY
+	if start > end {
+		start, end = end, start
+	}
+	return start, end, true
+}
+
+func (a *App) clearSelection(message string) {
+	a.selectionAnchor = -1
+	a.handoff = handoffHumanLed
+	a.statusMessage = message
+}
+
+func (a *App) expandSelection(delta int) {
+	if !a.hasSelection() {
+		a.selectionAnchor = a.cursorY
+	}
+	a.cursorY += delta
+	a.ensureCursorInBounds()
+	a.handoff = handoffHumanLed
+	start, end, _ := a.selectionRange()
+	if start == end {
+		a.statusMessage = fmt.Sprintf("Selection anchored on line %d.", start+1)
+		return
+	}
+	a.statusMessage = fmt.Sprintf("Selection spans lines %d-%d.", start+1, end+1)
+}
+
+func (a *App) moveSelectedBlock(delta int) {
+	if delta == 0 {
+		return
+	}
+	start, end, ok := a.selectionRange()
+	if !ok {
+		a.selectionAnchor = a.cursorY
+		start, end, _ = a.selectionRange()
+	}
+
+	content := a.tabs[a.activeTab].Content
+	if delta < 0 && start == 0 {
+		a.statusMessage = "Selection is already at the top edge."
+		return
+	}
+	if delta > 0 && end >= len(content)-1 {
+		a.statusMessage = "Selection is already at the bottom edge."
+		return
+	}
+
+	flags := a.lockedFlags()
+	if a.rangeLocked(start, end, flags) {
+		a.handoff = handoffDenied
+		a.statusMessage = "Locked lines cannot be moved as a selection block."
+		return
+	}
+
+	adjacent := start - 1
+	if delta > 0 {
+		adjacent = end + 1
+	}
+	if adjacent >= 0 && adjacent < len(flags) && flags[adjacent] {
+		a.handoff = handoffDenied
+		a.statusMessage = "Cannot swap selection across a locked line."
+		return
+	}
+
+	if delta < 0 {
+		aboveLine := content[start-1]
+		selected := append([]string(nil), content[start:end+1]...)
+		copy(content[start-1:], append(selected, aboveLine))
+
+		aboveLocked := flags[start-1]
+		selectedLocked := append([]bool(nil), flags[start:end+1]...)
+		copy(flags[start-1:], append(selectedLocked, aboveLocked))
+		start--
+		end--
+	} else {
+		belowLine := content[end+1]
+		selected := append([]string(nil), content[start:end+1]...)
+		copy(content[start:], append([]string{belowLine}, selected...))
+
+		belowLocked := flags[end+1]
+		selectedLocked := append([]bool(nil), flags[start:end+1]...)
+		copy(flags[start:], append([]bool{belowLocked}, selectedLocked...))
+		start++
+		end++
+	}
+
+	a.tabs[a.activeTab].Content = content
+	a.applyLockedFlags(flags)
+	a.selectionAnchor = start
+	a.cursorY = end
+	a.ensureCursorInBounds()
+	a.handoff = handoffHumanLed
+	a.statusMessage = fmt.Sprintf("Moved selected block to lines %d-%d.", start+1, end+1)
+}
+
+func (a *App) lockedFlags() []bool {
+	content := a.tabs[a.activeTab].Content
+	flags := make([]bool, len(content))
+	for index := range content {
+		flags[index] = a.tabs[a.activeTab].Locked[index]
+	}
+	return flags
+}
+
+func (a *App) applyLockedFlags(flags []bool) {
+	updated := make(map[int]bool)
+	for index, locked := range flags {
+		if locked {
+			updated[index] = true
+		}
+	}
+	a.tabs[a.activeTab].Locked = updated
+}
+
+func (a *App) rangeLocked(start, end int, flags []bool) bool {
+	for index := start; index <= end; index++ {
+		if flags[index] {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) activeLineRange() (int, int) {
+	if start, end, ok := a.selectionRange(); ok {
+		return start, end
+	}
+	return a.cursorY, a.cursorY
+}
+
+func (a *App) indentSelection() {
+	start, end := a.activeLineRange()
+	flags := a.lockedFlags()
+	if a.rangeLocked(start, end, flags) {
+		a.handoff = handoffDenied
+		a.statusMessage = "Locked lines cannot be indented."
+		return
+	}
+
+	for index := start; index <= end; index++ {
+		a.tabs[a.activeTab].Content[index] = a.indentUnit() + a.tabs[a.activeTab].Content[index]
+	}
+	if a.hasSelection() {
+		a.selectionAnchor = start
+		a.cursorY = end
+	} else {
+		a.cursorX += len([]rune(a.indentUnit()))
+	}
+	a.handoff = handoffHumanLed
+	if start == end {
+		a.statusMessage = fmt.Sprintf("Indented line %d.", start+1)
+	} else {
+		a.statusMessage = fmt.Sprintf("Indented lines %d-%d.", start+1, end+1)
+	}
+}
+
+func (a *App) outdentSelection() {
+	start, end := a.activeLineRange()
+	flags := a.lockedFlags()
+	if a.rangeLocked(start, end, flags) {
+		a.handoff = handoffDenied
+		a.statusMessage = "Locked lines cannot be outdented."
+		return
+	}
+
+	removedOnCursor := 0
+	for index := start; index <= end; index++ {
+		updated, removed := a.removeSingleIndent(a.tabs[a.activeTab].Content[index])
+		a.tabs[a.activeTab].Content[index] = updated
+		if index == a.cursorY {
+			removedOnCursor = removed
+		}
+	}
+	if !a.hasSelection() {
+		a.cursorX -= removedOnCursor
+		if a.cursorX < 0 {
+			a.cursorX = 0
+		}
+	}
+	a.handoff = handoffHumanLed
+	if start == end {
+		a.statusMessage = fmt.Sprintf("Outdented line %d.", start+1)
+	} else {
+		a.statusMessage = fmt.Sprintf("Outdented lines %d-%d.", start+1, end+1)
+	}
+}
+
+func (a *App) selectCodeBlock() {
+	content := a.tabs[a.activeTab].Content
+	if len(content) == 0 {
+		return
+	}
+
+	currentStart, currentEnd, hasSelection := a.selectionRange()
+	delimiterCandidates := uniqueSortedRanges(a.delimiterBlockCandidates(content))
+	indentCandidates := uniqueSortedRanges(a.indentBlockCandidates(content))
+	candidates := delimiterCandidates
+	if hasSelection {
+		if _, ok := a.nextEnclosingBlock(delimiterCandidates, currentStart, currentEnd); !ok {
+			if _, ok := a.smallestBlockForLine(delimiterCandidates, currentStart); !ok {
+				candidates = indentCandidates
+			}
+		}
+	} else if _, ok := a.smallestBlockForLine(delimiterCandidates, a.cursorY); !ok {
+		candidates = indentCandidates
+	}
+	if len(candidates) == 0 {
+		a.selectionAnchor = a.cursorY
+		a.handoff = handoffHumanLed
+		a.statusMessage = fmt.Sprintf("No enclosing block found; selected line %d.", a.cursorY+1)
+		return
+	}
+
+	if !hasSelection {
+		candidate, ok := a.smallestBlockForLine(candidates, a.cursorY)
+		if !ok {
+			a.selectionAnchor = a.cursorY
+			a.handoff = handoffHumanLed
+			a.statusMessage = fmt.Sprintf("No enclosing block found; selected line %d.", a.cursorY+1)
+			return
+		}
+		a.selectionAnchor = candidate.start
+		a.cursorY = candidate.end
+		a.ensureCursorInBounds()
+		a.handoff = handoffHumanLed
+		a.statusMessage = fmt.Sprintf("Selected code block lines %d-%d.", candidate.start+1, candidate.end+1)
+		return
+	}
+
+	if candidate, ok := a.nextEnclosingBlock(candidates, currentStart, currentEnd); ok {
+		a.selectionAnchor = candidate.start
+		a.cursorY = candidate.end
+		a.ensureCursorInBounds()
+		a.handoff = handoffHumanLed
+		a.statusMessage = fmt.Sprintf("Expanded to parent block lines %d-%d.", candidate.start+1, candidate.end+1)
+		return
+	}
+
+	a.handoff = handoffHumanLed
+	a.statusMessage = "No larger parent block found for the current selection."
+}
+
+func (a *App) blockCandidates() []lineRange {
+	content := a.tabs[a.activeTab].Content
+	if len(content) == 0 {
+		return nil
+	}
+
+	var candidates []lineRange
+	candidates = append(candidates, a.delimiterBlockCandidates(content)...)
+	candidates = append(candidates, a.indentBlockCandidates(content)...)
+	return uniqueSortedRanges(candidates)
+}
+
+func (a *App) smallestBlockForLine(candidates []lineRange, line int) (lineRange, bool) {
+	for _, candidate := range candidates {
+		if candidate.start <= line && line <= candidate.end {
+			return candidate, true
+		}
+	}
+	return lineRange{}, false
+}
+
+func (a *App) nextEnclosingBlock(candidates []lineRange, start, end int) (lineRange, bool) {
+	for _, candidate := range candidates {
+		if candidate.start <= start && candidate.end >= end && (candidate.start < start || candidate.end > end) {
+			return candidate, true
+		}
+	}
+	return lineRange{}, false
+}
+
+func (a *App) delimiterBlockCandidates(content []string) []lineRange {
+	closers := map[rune]rune{')': '(', ']': '[', '}': '{'}
+	type opener struct {
+		line int
+		r    rune
+	}
+	var stack []opener
+	var candidates []lineRange
+
+	for lineIndex, line := range content {
+		for _, r := range []rune(line) {
+			switch r {
+			case '(', '[', '{':
+				stack = append(stack, opener{line: lineIndex, r: r})
+			case ')', ']', '}':
+				expected := closers[r]
+				for len(stack) > 0 {
+					last := stack[len(stack)-1]
+					stack = stack[:len(stack)-1]
+					if last.r == expected {
+						if last.line < lineIndex {
+							candidates = append(candidates, lineRange{start: last.line, end: lineIndex})
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
+	return candidates
+}
+
+func (a *App) indentBlockCandidates(content []string) []lineRange {
+	anchor := a.nearestCodeLine(a.cursorY)
+	if anchor < 0 {
+		return nil
+	}
+
+	var candidates []lineRange
+	seen := map[int]bool{}
+
+	for lineIndex := anchor; lineIndex >= 0; lineIndex-- {
+		trimmed := strings.TrimSpace(content[lineIndex])
+		if trimmed == "" {
+			continue
+		}
+		indent := lineIndent(content[lineIndex])
+		if lineIndex != anchor && !looksLikeBlockHeader(trimmed) {
+			nextLine := a.nearestCodeLineBelow(lineIndex + 1)
+			if nextLine < 0 {
+				continue
+			}
+			nextIndent := lineIndent(content[nextLine])
+			if nextIndent <= indent {
+				continue
+			}
+		}
+		end := findIndentedBlockEnd(content, lineIndex)
+		if end <= lineIndex || anchor > end {
+			continue
+		}
+		if !seen[lineIndex] {
+			candidates = append(candidates, lineRange{start: lineIndex, end: end})
+			seen[lineIndex] = true
+		}
+	}
+
+	return candidates
+}
+
+func (a *App) nearestCodeLine(start int) int {
+	content := a.tabs[a.activeTab].Content
+	if len(content) == 0 {
+		return -1
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(content) {
+		start = len(content) - 1
+	}
+	for distance := 0; distance < len(content); distance++ {
+		up := start - distance
+		if up >= 0 && strings.TrimSpace(content[up]) != "" {
+			return up
+		}
+		down := start + distance
+		if distance > 0 && down < len(content) && strings.TrimSpace(content[down]) != "" {
+			return down
+		}
+	}
+	return -1
+}
+
+func (a *App) nearestCodeLineBelow(start int) int {
+	content := a.tabs[a.activeTab].Content
+	for index := start; index < len(content); index++ {
+		if strings.TrimSpace(content[index]) != "" {
+			return index
+		}
+	}
+	return -1
+}
+
+func uniqueSortedRanges(ranges []lineRange) []lineRange {
+	seen := make(map[string]bool)
+	unique := make([]lineRange, 0, len(ranges))
+	for _, candidate := range ranges {
+		if candidate.start < 0 || candidate.end < candidate.start {
+			continue
+		}
+		key := fmt.Sprintf("%d:%d", candidate.start, candidate.end)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		unique = append(unique, candidate)
+	}
+
+	sort.Slice(unique, func(i, j int) bool {
+		leftSize := unique[i].end - unique[i].start
+		rightSize := unique[j].end - unique[j].start
+		if leftSize != rightSize {
+			return leftSize < rightSize
+		}
+		if unique[i].start != unique[j].start {
+			return unique[i].start > unique[j].start
+		}
+		return unique[i].end < unique[j].end
+	})
+
+	return unique
+}
+
+func findIndentedBlockEnd(content []string, start int) int {
+	if start < 0 || start >= len(content) {
+		return start
+	}
+	baseIndent := lineIndent(content[start])
+	end := start
+	for index := start + 1; index < len(content); index++ {
+		trimmed := strings.TrimSpace(content[index])
+		if trimmed == "" {
+			if end >= start {
+				end = index
+			}
+			continue
+		}
+		if lineIndent(content[index]) <= baseIndent {
+			break
+		}
+		end = index
+	}
+	return end
+}
+
+func lineIndent(line string) int {
+	indent := 0
+	for _, r := range []rune(line) {
+		switch r {
+		case ' ':
+			indent++
+		case '\t':
+			indent += 4
+		default:
+			return indent
+		}
+	}
+	return indent
+}
+
+func (a *App) removeSingleIndent(line string) (string, int) {
+	if strings.HasPrefix(line, "\t") {
+		return strings.TrimPrefix(line, "\t"), 1
+	}
+	indentUnit := a.indentUnit()
+	if strings.HasPrefix(line, indentUnit) {
+		return strings.TrimPrefix(line, indentUnit), len([]rune(indentUnit))
+	}
+	spaces := 0
+	for _, r := range []rune(line) {
+		if r != ' ' || spaces == len([]rune(indentUnit)) {
+			break
+		}
+		spaces++
+	}
+	if spaces == 0 {
+		return line, 0
+	}
+	return line[spaces:], spaces
+}
+
+func looksLikeBlockHeader(trimmed string) bool {
+	if trimmed == "" {
+		return false
+	}
+	return strings.HasSuffix(trimmed, "{") || strings.HasSuffix(trimmed, ":")
 }
 
 func (a *App) currentLineLocked() bool {
@@ -412,6 +1219,14 @@ func (a *App) draw() {
 	a.drawEditSurface(0, editTop, w, editBottom-editTop+1)
 	a.drawControlPanel(0, h-bottomHeight, controlWidth, bottomHeight)
 	a.drawStatusSurface(statusX, h-bottomHeight, w-statusX, bottomHeight)
+	if a.helpVisible {
+		a.screen.HideCursor()
+		a.drawHelpDialog(w, h)
+	}
+	if a.quitConfirm {
+		a.screen.HideCursor()
+		a.drawQuitDialog(w, h)
+	}
 	a.screen.Show()
 }
 
@@ -436,13 +1251,29 @@ func (a *App) drawEditSurface(x, y, width, height int) {
 	content := a.tabs[a.activeTab].Content
 	for i := 0; i < len(content) && i < height-2; i++ {
 		lineY := y + 1 + i
-		line := content[i]
+		line := trimRunes(content[i], width-5)
 		gutter, style := a.lineVisual(i)
 		a.drawText(x+1, lineY, styleGutter(), gutter)
-		a.drawText(x+4, lineY, style, trimRunes(line, width-5))
+		a.drawTextWithVisibleTabs(x+4, lineY, style, line)
 	}
-	footer := fmt.Sprintf("Focus:%s  Scope:%s  Tabs:[Tab/Shift+Tab]  Control:[Ctrl+G/:]  Toggle Selection:[v]  Quit:[q/Ctrl+C]", a.focusLabel(), a.currentScope())
+	footer := fmt.Sprintf("Focus:%s  Scope:%s  Indent:[Tab/Shift+Tab]  Width:[Alt+1..4]  Tabs:[Alt+,/Alt+. or Ctrl+Tab/Ctrl+Shift+Tab]  Block:[F2/Ctrl+Space/Ctrl+[]  Move:[Ctrl+Up/Down]  Control:[Ctrl+G]  Quit:[Ctrl+C]", a.focusLabel(), a.currentScope())
+	if a.helpVisible {
+		footer = fmt.Sprintf("Focus:%s  Scope:%s  Help:[Esc closes]", a.focusLabel(), a.currentScope())
+	}
 	a.drawText(x+1, y+height-1, styleMuted(), trimRunes(footer, width-2))
+	if a.focus == focusEditor && !a.helpVisible && !a.quitConfirm {
+		cursorX := x + 4 + a.cursorX
+		cursorY := y + 1 + a.cursorY
+		maxX := x + width - 2
+		maxY := y + height - 2
+		if cursorX > maxX {
+			cursorX = maxX
+		}
+		if cursorY > maxY {
+			cursorY = maxY
+		}
+		a.screen.ShowCursor(cursorX, cursorY)
+	}
 }
 
 func (a *App) drawControlPanel(x, y, width, height int) {
@@ -466,7 +1297,7 @@ func (a *App) drawControlPanel(x, y, width, height int) {
 			cursorX = maxX
 		}
 		a.screen.ShowCursor(cursorX, y+1)
-	} else {
+	} else if a.focus != focusEditor {
 		a.screen.HideCursor()
 	}
 }
@@ -476,6 +1307,7 @@ func (a *App) drawStatusSurface(x, y, width, height int) {
 	lines := []string{
 		"tab: " + a.tabs[a.activeTab].Title,
 		"scope: " + a.currentScope(),
+		"indent: " + a.indentModeLabel(),
 		"agent: " + a.agentState(),
 		"handoff: " + string(a.handoff),
 		fmt.Sprintf("review: %d pending", a.reviewCount),
@@ -492,6 +1324,122 @@ func (a *App) drawStatusSurface(x, y, width, height int) {
 			reviewLine = fmt.Sprintf("queue: %s %s", item.ID, item.Target)
 		}
 		a.drawText(x+1, y+height-2, stylePreview(), trimRunes(reviewLine, width-2))
+	}
+}
+
+func (a *App) drawHelpDialog(screenWidth, screenHeight int) {
+	lines := []string{
+		"gdedit help",
+		"",
+		"F1 opens this help dialog.",
+		"Esc closes the help dialog, clears a preview, or clears a selection.",
+		"",
+		"Editor",
+		"  Tab              insert literal tab, or indent active selection",
+		"  Shift+Tab        outdent current line or selection",
+		"  Alt+.            next tab",
+		"  Alt+,            previous tab",
+		"  Alt+0            use literal tabs for selection indentation",
+		"  Alt+1..Alt+4     set indentation width in spaces",
+		"  colored »        visible marker for literal tab characters",
+		"  Ctrl+Tab         same intent, but many terminals swallow it",
+		"  Ctrl+Shift+Tab   same intent, but many terminals swallow it",
+		"  F2               select current block, then parent block",
+		"  Ctrl+Space       same intent, but some terminals drop it",
+		"  Ctrl+[           same intent, but some terminals treat it as Esc",
+		"  Ctrl+G           focus control hub",
+		"  Alt+Up/Down      grow or shrink line selection",
+		"  Shift+Up/Down    fallback selection keys",
+		"  Ctrl+Up/Down     swap selected block with adjacent line",
+		"  Ctrl+C           open quit confirmation",
+		"",
+		"Control hub",
+		"  Type a short command, then press Enter for preview.",
+		"  Press Enter again to confirm apply.",
+		"  Example: simplify this block",
+		"  Example: inspect recent change",
+		"",
+		"Cowork states",
+		"  L! locked region   P> proposal   R? review-needed",
+		"  H* human-selected  A+ approved   X! denied",
+	}
+
+	maxLen := 0
+	for _, line := range lines {
+		if n := len([]rune(line)); n > maxLen {
+			maxLen = n
+		}
+	}
+
+	width := maxLen + 4
+	height := len(lines) + 2
+	if width > screenWidth-4 {
+		width = screenWidth - 4
+	}
+	if height > screenHeight-2 {
+		height = screenHeight - 2
+	}
+	x := (screenWidth - width) / 2
+	y := (screenHeight - height) / 2
+
+	for dy := y; dy < y+height; dy++ {
+		for dx := x; dx < x+width; dx++ {
+			a.screen.SetContent(dx, dy, ' ', nil, styleDialogFill())
+		}
+	}
+
+	a.drawBox(x, y, width, height, styleDialogBorder(), "Help")
+	for i := 0; i < len(lines) && i < height-2; i++ {
+		style := styleDialogText()
+		if i == 0 {
+			style = styleDialogTitle()
+		}
+		a.drawText(x+2, y+1+i, style, trimRunes(lines[i], width-4))
+	}
+}
+
+func (a *App) drawQuitDialog(screenWidth, screenHeight int) {
+	lines := []string{
+		"Quit gdedit?",
+		"",
+		"Ctrl+C often means copy muscle memory in terminal apps.",
+		"To avoid accidental exits, gdedit asks before quitting.",
+		"",
+		"Press Enter or y to exit.",
+		"Press Esc or n to return to the editor.",
+	}
+
+	maxLen := 0
+	for _, line := range lines {
+		if n := len([]rune(line)); n > maxLen {
+			maxLen = n
+		}
+	}
+
+	width := maxLen + 4
+	height := len(lines) + 2
+	if width > screenWidth-6 {
+		width = screenWidth - 6
+	}
+	if height > screenHeight-4 {
+		height = screenHeight - 4
+	}
+	x := (screenWidth - width) / 2
+	y := (screenHeight - height) / 2
+
+	for dy := y; dy < y+height; dy++ {
+		for dx := x; dx < x+width; dx++ {
+			a.screen.SetContent(dx, dy, ' ', nil, styleDialogFill())
+		}
+	}
+
+	a.drawBox(x, y, width, height, styleQuitBorder(), "Confirm Exit")
+	for i := 0; i < len(lines) && i < height-2; i++ {
+		style := styleDialogText()
+		if i == 0 {
+			style = styleQuitTitle()
+		}
+		a.drawText(x+2, y+1+i, style, trimRunes(lines[i], width-4))
 	}
 }
 
@@ -538,7 +1486,7 @@ func (a *App) lineVisual(index int) (string, tcell.Style) {
 			return "A+ ", styleApproved()
 		}
 	}
-	if a.selectionOn && index == a.cursorY {
+	if start, end, ok := a.selectionRange(); ok && index >= start && index <= end {
 		return "H* ", styleSelection()
 	}
 	if index == a.cursorY {
@@ -584,6 +1532,18 @@ func (a *App) drawText(x, y int, style tcell.Style, text string) {
 	}
 }
 
+func (a *App) drawTextWithVisibleTabs(x, y int, style tcell.Style, text string) {
+	for i, r := range []rune(text) {
+		cellRune := r
+		cellStyle := style
+		if r == '\t' {
+			cellRune = []rune(tabGlyph)[0]
+			cellStyle = styleTabGlyph()
+		}
+		a.screen.SetContent(x+i, y, cellRune, nil, cellStyle)
+	}
+}
+
 func trimRunes(input string, max int) string {
 	if max <= 0 {
 		return ""
@@ -612,6 +1572,10 @@ func styleBox() tcell.Style {
 
 func styleTabActive() tcell.Style {
 	return tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorAqua)
+}
+
+func styleTabGlyph() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorLightCyan)
 }
 
 func styleSelection() tcell.Style {
@@ -652,4 +1616,28 @@ func styleGutter() tcell.Style {
 
 func styleError() tcell.Style {
 	return tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.ColorMaroon)
+}
+
+func styleDialogFill() tcell.Style {
+	return tcell.StyleDefault.Background(tcell.Color234).Foreground(tcell.ColorWhite)
+}
+
+func styleDialogBorder() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorLightCyan).Background(tcell.Color234)
+}
+
+func styleDialogText() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.Color234)
+}
+
+func styleDialogTitle() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorLightCyan)
+}
+
+func styleQuitBorder() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorYellow).Background(tcell.Color234)
+}
+
+func styleQuitTitle() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorYellow)
 }

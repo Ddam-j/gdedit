@@ -87,3 +87,20 @@
 
 - Temporary tmux verification scripts were removed after validation.
 - Phase 5 is complete in the product-core plan and the next implementation target is Phase 6.
+
+## Post-Phase 6 Usability Refinement
+
+- Reworked the editor keymap so printable characters are no longer stolen by mnemonic shortcuts.
+- Added a visible help flow (`F1` / `Esc`) and a quit confirmation flow on `Ctrl+C`.
+- Added direct editor mutations for insert, delete, newline split, merge, and visible caret handling.
+- Added example tabs for Go, Python, TypeScript, and YAML so block-selection behavior can be tested in-place.
+- Added hierarchical block selection with a terminal-safe default on `F2`; `Ctrl+[` and `Ctrl+Space` remain best-effort aliases.
+- Scoped cursor and selection state per tab so tab switching preserves the active tab's own selection instead of leaking selection across tabs.
+- Moved tab navigation to `Alt+.` and `Alt+,` because `Ctrl+Tab` is unreliable in many terminal stacks.
+- Changed indentation policy to user-directed editing:
+  - `Tab` inserts a literal `\t` when there is no selection.
+  - `Tab` indents only the active selection.
+  - `Shift+Tab` outdents the active selection.
+  - `Alt+0` switches selection indentation to literal tabs.
+  - `Alt+1` through `Alt+4` switch selection indentation to 1-4 spaces.
+- Split stored tab characters from displayed tab markers: literal `\t` is saved in the buffer, but renders as a styled `»` marker in the edit surface.
