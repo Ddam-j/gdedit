@@ -57,6 +57,23 @@
   - preview/confirm command loop
   - status updates for focus, scope, review, and voice state
 
+### Phase 6 - Cowork Editing MVP
+
+- Extended `internal/tui/commands.go` with bounded preview kinds, proposal IDs, review labels, and locked-scope denial behavior.
+- Extended `internal/tui/app.go` with visible handoff states, review queue wiring, cowork line markers, and locked-region handling.
+- Added first cowork-state rendering on the edit surface:
+  - `L!` locked region
+  - `P>` agent proposal
+  - `R?` review-needed or inspect state
+  - `H*` human-selected edit line
+  - `A+` approved state
+  - `X!` denied change in locked scope
+- Added Phase 6 tests for preview kinds and locked-scope denial in `internal/tui/commands_test.go`.
+- Verified three tmux-driven shell paths:
+  - locked-scope denial preview
+  - unlocked proposal preview with review queue
+  - proposal apply returning focus to editor
+
 ## Verification
 
 - `go test ./...` passed.
