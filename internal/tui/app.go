@@ -22,6 +22,24 @@ const (
 type Tab struct {
 	Title   string
 	Content []string
+	Locked  map[int]bool
+}
+
+type handoffState string
+
+const (
+	handoffHumanLed      handoffState = "human-led"
+	handoffAgentSuggest  handoffState = "agent-suggesting"
+	handoffReviewPending handoffState = "review-pending"
+	handoffApplying      handoffState = "applying"
+	handoffDenied        handoffState = "locked/denied"
+)
+
+type reviewItem struct {
+	ID     string
+	Action string
+	Target string
+	State  handoffState
 }
 
 type App struct {
@@ -38,6 +56,9 @@ type App struct {
 	statusMessage string
 	voiceState    string
 	reviewCount   int
+	handoff       handoffState
+	reviewItems   []reviewItem
+	lastApplied   string
 }
 
 func New() *App {
@@ -53,6 +74,7 @@ func New() *App {
 					"	println(\"gdedit\")",
 					"}",
 				},
+				Locked: map[int]bool{0: true, 2: true},
 			},
 			{
 				Title: "review.diff",
@@ -63,6 +85,7 @@ func New() *App {
 					"",
 					"Use the control hub to inspect or hold proposals.",
 				},
+				Locked: map[int]bool{0: true},
 			},
 			{
 				Title: "notes.md",
@@ -72,11 +95,13 @@ func New() *App {
 					"- Voice flows into control",
 					"- Preview before apply",
 				},
+				Locked: map[int]bool{},
 			},
 		},
 		focus:         focusEditor,
 		statusMessage: "Ready. Ctrl+G focuses the control hub.",
 		voiceState:    "off",
+		handoff:       handoffHumanLed,
 	}
 }
 
@@ -136,6 +161,7 @@ func (a *App) handleEditorKey(ev *tcell.EventKey) bool {
 	case tcell.KeyCtrlG:
 		a.focus = focusControl
 		a.voiceState = "ready"
+		a.handoff = handoffAgentSuggest
 		a.statusMessage = "Control hub focused. Type a command and press Enter for preview."
 		return false
 	case tcell.KeyTab:
@@ -163,6 +189,7 @@ func (a *App) handleEditorKey(ev *tcell.EventKey) bool {
 			} else {
 				a.statusMessage = "Selection cleared."
 			}
+			a.handoff = handoffHumanLed
 		case ']':
 			a.nextTab()
 		case '[':
@@ -170,6 +197,7 @@ func (a *App) handleEditorKey(ev *tcell.EventKey) bool {
 		case ':':
 			a.focus = focusControl
 			a.voiceState = "ready"
+			a.handoff = handoffAgentSuggest
 			a.statusMessage = "Control hub focused from editor shortcut."
 		}
 	}
@@ -182,18 +210,26 @@ func (a *App) handleControlKey(ev *tcell.EventKey) bool {
 	switch ev.Key() {
 	case tcell.KeyEsc:
 		if a.preview.Pending {
+			if a.preview.Kind == CommandDenied {
+				a.handoff = handoffDenied
+			} else {
+				a.handoff = handoffHumanLed
+			}
 			a.preview = Preview{}
+			a.reviewItems = nil
 			a.reviewCount = 0
 			a.statusMessage = "Preview cleared. You can edit the command before submitting again."
 			return false
 		}
 		a.focus = focusEditor
 		a.voiceState = "off"
+		a.handoff = handoffHumanLed
 		a.statusMessage = "Returned to editor focus."
 		return false
 	case tcell.KeyCtrlG:
 		a.focus = focusEditor
 		a.voiceState = "off"
+		a.handoff = handoffHumanLed
 		a.statusMessage = "Returned to editor focus."
 		return false
 	case tcell.KeyEnter:
@@ -204,20 +240,38 @@ func (a *App) handleControlKey(ev *tcell.EventKey) bool {
 		}
 
 		if !a.preview.Pending {
-			a.preview = BuildPreview(input, a.currentScope(), a.tabs[a.activeTab].Title)
-			a.reviewCount = 1
-			a.statusMessage = "Preview ready. Press Enter again to confirm or Esc to edit."
+			a.preview = BuildPreview(input, a.currentScope(), a.tabs[a.activeTab].Title, a.currentLineLocked())
+			a.reviewItems = a.buildReviewItems(a.preview)
+			a.reviewCount = len(a.reviewItems)
+			a.handoff = a.previewState(a.preview)
+			if a.preview.Kind == CommandDenied {
+				a.statusMessage = "Preview denied. Current scope is locked; narrow the target or inspect only."
+			} else {
+				a.statusMessage = "Preview ready. Press Enter again to confirm or Esc to edit."
+			}
 			a.voiceState = "captured"
 			return false
 		}
 
+		if a.preview.Kind == CommandDenied {
+			a.statusMessage = "Denied change kept in review. Locked scope remains unchanged."
+			a.focus = focusEditor
+			a.voiceState = "off"
+			a.preview = Preview{}
+			return false
+		}
+
+		a.lastApplied = a.preview.ProposalID
+		a.handoff = handoffApplying
 		a.statusMessage = "Applied to " + a.preview.Target + " in " + a.preview.Tab + ": " + a.preview.Action
+		a.reviewItems = nil
 		a.preview = Preview{}
 		a.controlInput = nil
 		a.controlCursor = 0
 		a.reviewCount = 0
 		a.focus = focusEditor
 		a.voiceState = "off"
+		a.handoff = handoffHumanLed
 		return false
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if a.controlCursor > 0 {
@@ -244,7 +298,10 @@ func (a *App) handleControlKey(ev *tcell.EventKey) bool {
 		a.controlInput = append(a.controlInput[:a.controlCursor], append([]rune{r}, a.controlInput[a.controlCursor:]...)...)
 		a.controlCursor++
 		a.preview = Preview{}
+		a.reviewItems = nil
+		a.reviewCount = 0
 		a.voiceState = "listening"
+		a.handoff = handoffAgentSuggest
 		return false
 	}
 
@@ -271,6 +328,45 @@ func (a *App) currentScope() string {
 		return fmt.Sprintf("selection:L%d", a.cursorY+1)
 	}
 	return fmt.Sprintf("cursor:L%d:C%d", a.cursorY+1, a.cursorX+1)
+}
+
+func (a *App) currentLineLocked() bool {
+	locked := a.tabs[a.activeTab].Locked
+	return locked != nil && locked[a.cursorY]
+}
+
+func (a *App) buildReviewItems(preview Preview) []reviewItem {
+	if !preview.Pending {
+		return nil
+	}
+
+	state := a.previewState(preview)
+	if preview.ProposalID == "" {
+		return []reviewItem{{
+			ID:     preview.ReviewLabel,
+			Action: preview.Action,
+			Target: preview.Target,
+			State:  state,
+		}}
+	}
+
+	return []reviewItem{{
+		ID:     preview.ProposalID,
+		Action: preview.Action,
+		Target: preview.Target,
+		State:  state,
+	}}
+}
+
+func (a *App) previewState(preview Preview) handoffState {
+	switch preview.Kind {
+	case CommandDenied:
+		return handoffDenied
+	case CommandApprove:
+		return handoffApplying
+	default:
+		return handoffReviewPending
+	}
 }
 
 func (a *App) ensureCursorInBounds() {
@@ -341,13 +437,9 @@ func (a *App) drawEditSurface(x, y, width, height int) {
 	for i := 0; i < len(content) && i < height-2; i++ {
 		lineY := y + 1 + i
 		line := content[i]
-		style := styleNormal()
-		if a.selectionOn && i == a.cursorY {
-			style = styleSelection()
-		} else if i == a.cursorY {
-			style = styleCursorLine()
-		}
-		a.drawText(x+1, lineY, style, trimRunes(line, width-2))
+		gutter, style := a.lineVisual(i)
+		a.drawText(x+1, lineY, styleGutter(), gutter)
+		a.drawText(x+4, lineY, style, trimRunes(line, width-5))
 	}
 	footer := fmt.Sprintf("Focus:%s  Scope:%s  Tabs:[Tab/Shift+Tab]  Control:[Ctrl+G/:]  Toggle Selection:[v]  Quit:[q/Ctrl+C]", a.focusLabel(), a.currentScope())
 	a.drawText(x+1, y+height-1, styleMuted(), trimRunes(footer, width-2))
@@ -385,12 +477,21 @@ func (a *App) drawStatusSurface(x, y, width, height int) {
 		"tab: " + a.tabs[a.activeTab].Title,
 		"scope: " + a.currentScope(),
 		"agent: " + a.agentState(),
+		"handoff: " + string(a.handoff),
 		fmt.Sprintf("review: %d pending", a.reviewCount),
 		"voice: " + a.voiceState,
-		"status: " + a.statusMessage,
+		"proposal: " + a.previewIDOrLastApplied(),
 	}
 	for i := 0; i < len(lines) && i < height-2; i++ {
 		a.drawText(x+1, y+1+i, styleMuted(), trimRunes(lines[i], width-2))
+	}
+	if height >= 4 {
+		reviewLine := "queue: none"
+		if len(a.reviewItems) > 0 {
+			item := a.reviewItems[0]
+			reviewLine = fmt.Sprintf("queue: %s %s", item.ID, item.Target)
+		}
+		a.drawText(x+1, y+height-2, stylePreview(), trimRunes(reviewLine, width-2))
 	}
 }
 
@@ -398,10 +499,55 @@ func (a *App) agentState() string {
 	if a.preview.Pending {
 		return "review"
 	}
+	if a.handoff == handoffDenied {
+		return "denied"
+	}
 	if a.focus == focusControl {
 		return "suggesting"
 	}
 	return "idle"
+}
+
+func (a *App) previewIDOrLastApplied() string {
+	if a.preview.ProposalID != "" {
+		return a.preview.ProposalID
+	}
+	if a.lastApplied != "" {
+		return a.lastApplied
+	}
+	if a.preview.Kind == CommandDenied {
+		return "locked-scope"
+	}
+	return "none"
+}
+
+func (a *App) lineVisual(index int) (string, tcell.Style) {
+	locked := a.tabs[a.activeTab].Locked[index]
+	if locked {
+		return "L! ", styleLocked()
+	}
+	if a.preview.Pending && index == a.cursorY {
+		switch a.preview.Kind {
+		case CommandDenied:
+			return "X! ", styleDenied()
+		case CommandPropose:
+			return "P> ", styleProposal()
+		case CommandReview, CommandInspect:
+			return "R? ", styleReviewNeeded()
+		case CommandApprove:
+			return "A+ ", styleApproved()
+		}
+	}
+	if a.selectionOn && index == a.cursorY {
+		return "H* ", styleSelection()
+	}
+	if index == a.cursorY {
+		return ">  ", styleCursorLine()
+	}
+	if a.lastApplied != "" && index == a.cursorY {
+		return "A+ ", styleApproved()
+	}
+	return "   ", styleNormal()
 }
 
 func (a *App) focusLabel() string {
@@ -478,6 +624,30 @@ func styleCursorLine() tcell.Style {
 
 func stylePreview() tcell.Style {
 	return tcell.StyleDefault.Foreground(tcell.ColorLightGreen)
+}
+
+func styleProposal() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorLightBlue)
+}
+
+func styleReviewNeeded() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorOrange)
+}
+
+func styleLocked() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.ColorMaroon)
+}
+
+func styleApproved() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorLightGreen)
+}
+
+func styleDenied() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.ColorPurple)
+}
+
+func styleGutter() tcell.Style {
+	return tcell.StyleDefault.Foreground(tcell.ColorAqua)
 }
 
 func styleError() tcell.Style {
