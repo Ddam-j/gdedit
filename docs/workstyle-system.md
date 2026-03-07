@@ -112,6 +112,14 @@ That means a workstyle expresses:
 - prefers predictable keys such as function keys or `Alt`-modified runes over desktop-only shortcut assumptions
 - treats best-effort aliases as optional, not canonical
 - separates storage characters from rendered markers when the terminal cannot faithfully represent width-sensitive text
+- accepts redundant modifier paths when terminals inconsistently forward `Shift`, `Alt`, or combined variants
+
+### Keyboard-First Selection Style
+
+- treats selection as a character-range operation anchored by carets
+- keeps structural edits line-aware by projecting the text selection to covered lines
+- uses clipboard operations on the selected text, not on implicit line blocks
+- prefers keyboard selection over mouse-based internal editing semantics in terminal environments
 
 ## Shareability
 

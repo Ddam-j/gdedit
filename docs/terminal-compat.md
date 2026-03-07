@@ -39,8 +39,10 @@ Terminal key delivery is not uniform. `gdedit` treats some shortcuts as best-eff
 |-----|-------------|--------------|
 | `F1` | High | Help dialog |
 | `F2` | High | Hierarchical block selection |
-| `Ctrl+C` | High | Quit confirmation |
+| `Ctrl+Q` | High | Quit confirmation |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Medium | Internal copy, cut, and paste |
 | `Alt+.` / `Alt+,` | Medium to high | Primary tab navigation |
+| `Shift`, `Alt`, `Shift+Alt` with arrows | Medium | Selection expansion modifiers; any one may be missing depending on terminal |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Low | Best-effort tab navigation alias |
 | `Ctrl+[` | Low | Best-effort block-selection alias; often delivered as `Esc` |
 | `Ctrl+Space` | Low | Best-effort block-selection alias; often dropped |
@@ -56,6 +58,15 @@ When terminal behavior is inconsistent, gdedit prefers keys that arrive predicta
 - selection indentation is handled separately through configurable indentation units
 
 This keeps storage and display separate, avoids cursor-width ambiguity, and makes tab characters auditable inside a terminal-first editor.
+
+## Selection Contract
+
+`gdedit` now treats selection as a keyboard-driven character range, not a line-only highlight.
+
+- `Shift`, `Alt`, and `Shift+Alt` are all accepted as selection modifiers for movement keys.
+- The visible selection is the true text range between the anchor caret and the active caret.
+- Structural edits still work on covered lines by projecting the text selection to its start and end lines.
+- Terminal mouse drag remains an external terminal selection, not an internal gdedit edit selection.
 
 ## Supported Terminals
 

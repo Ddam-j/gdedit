@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -23,12 +24,13 @@ const (
 )
 
 type Tab struct {
-	Title           string
-	Content         []string
-	Locked          map[int]bool
-	CursorX         int
-	CursorY         int
-	SelectionAnchor int
+	Title            string
+	Content          []string
+	Locked           map[int]bool
+	CursorX          int
+	CursorY          int
+	SelectionAnchorX int
+	SelectionAnchorY int
 }
 
 type handoffState string
@@ -53,26 +55,33 @@ type lineRange struct {
 	end   int
 }
 
+type textPos struct {
+	x int
+	y int
+}
+
 type App struct {
-	screen          tcell.Screen
-	tabs            []Tab
-	activeTab       int
-	focus           focusArea
-	controlInput    []rune
-	controlCursor   int
-	preview         Preview
-	cursorX         int
-	cursorY         int
-	selectionAnchor int
-	statusMessage   string
-	voiceState      string
-	reviewCount     int
-	handoff         handoffState
-	reviewItems     []reviewItem
-	lastApplied     string
-	helpVisible     bool
-	quitConfirm     bool
-	indentWidth     int
+	screen             tcell.Screen
+	tabs               []Tab
+	activeTab          int
+	focus              focusArea
+	controlInput       []rune
+	controlCursor      int
+	preview            Preview
+	cursorX            int
+	cursorY            int
+	selectionAnchorCol int
+	selectionAnchor    int
+	statusMessage      string
+	voiceState         string
+	reviewCount        int
+	handoff            handoffState
+	reviewItems        []reviewItem
+	lastApplied        string
+	helpVisible        bool
+	quitConfirm        bool
+	indentWidth        int
+	clipboard          string
 }
 
 func New() *App {
@@ -90,8 +99,8 @@ func New() *App {
 					"	return fallback(input)",
 					"}",
 				},
-				Locked:          map[int]bool{0: true, 2: true},
-				SelectionAnchor: -1,
+				Locked:           map[int]bool{0: true, 2: true},
+				SelectionAnchorY: -1,
 			},
 			{
 				Title: "worker.py",
@@ -103,8 +112,8 @@ func New() *App {
 					"                return step.name",
 					"    return \"idle\"",
 				},
-				Locked:          map[int]bool{0: true},
-				SelectionAnchor: -1,
+				Locked:           map[int]bool{0: true},
+				SelectionAnchorY: -1,
 			},
 			{
 				Title: "panel.ts",
@@ -119,8 +128,8 @@ func New() *App {
 					"  return { title: \"Editor\", items: [] }",
 					"}",
 				},
-				Locked:          map[int]bool{0: true},
-				SelectionAnchor: -1,
+				Locked:           map[int]bool{0: true},
+				SelectionAnchorY: -1,
 			},
 			{
 				Title: "config.yaml",
@@ -132,8 +141,8 @@ func New() *App {
 					"    move_block_up: ctrl-up",
 					"    move_block_down: ctrl-down",
 				},
-				Locked:          map[int]bool{0: true},
-				SelectionAnchor: -1,
+				Locked:           map[int]bool{0: true},
+				SelectionAnchorY: -1,
 			},
 		},
 		focus:           focusEditor,
@@ -182,7 +191,7 @@ func (a *App) Run() (err error) {
 }
 
 func (a *App) handleKey(ev *tcell.EventKey) bool {
-	if ev.Key() == tcell.KeyCtrlC {
+	if ev.Key() == tcell.KeyCtrlQ {
 		a.quitConfirm = true
 		a.statusMessage = "Quit confirmation opened. Press Enter or y to exit, Esc or n to stay."
 		return false
@@ -268,31 +277,92 @@ func (a *App) handleEditorKey(ev *tcell.EventKey) bool {
 		}
 		return false
 	case tcell.KeyUp:
+		if ev.Modifiers()&(tcell.ModCtrl|tcell.ModAlt) == (tcell.ModCtrl | tcell.ModAlt) {
+			a.statusMessage = "Ctrl+Alt+Up is reserved and does nothing."
+			return false
+		}
 		if ev.Modifiers()&tcell.ModCtrl != 0 {
-			a.moveSelectedBlock(-1)
+			if a.hasSelection() {
+				a.moveSelectedBlock(-1)
+			} else {
+				a.removeBlankLineAbove()
+			}
 			return false
 		}
-		if ev.Modifiers()&(tcell.ModAlt|tcell.ModShift) != 0 {
-			a.expandSelection(-1)
+		if hasSelectionModifier(ev.Modifiers()) {
+			a.moveCaretVertical(-1, true)
 			return false
 		}
-		a.cursorY--
+		a.moveCaretVertical(-1, false)
 	case tcell.KeyDown:
+		if ev.Modifiers()&(tcell.ModCtrl|tcell.ModAlt) == (tcell.ModCtrl | tcell.ModAlt) {
+			a.statusMessage = "Ctrl+Alt+Down is reserved and does nothing."
+			return false
+		}
 		if ev.Modifiers()&tcell.ModCtrl != 0 {
-			a.moveSelectedBlock(1)
+			if a.hasSelection() {
+				a.moveSelectedBlock(1)
+			} else {
+				a.insertLineAbove()
+			}
 			return false
 		}
-		if ev.Modifiers()&(tcell.ModAlt|tcell.ModShift) != 0 {
-			a.expandSelection(1)
+		if hasSelectionModifier(ev.Modifiers()) {
+			a.moveCaretVertical(1, true)
 			return false
 		}
-		a.cursorY++
+		a.moveCaretVertical(1, false)
 	case tcell.KeyLeft:
-		a.cursorX--
+		if hasWordSelectionModifier(ev.Modifiers()) {
+			a.moveCaretWord(-1, true)
+			return false
+		}
+		if hasWordMoveModifier(ev.Modifiers()) {
+			a.moveCaretWord(-1, false)
+			return false
+		}
+		if hasSelectionModifier(ev.Modifiers()) {
+			a.moveCaretHorizontal(-1, true)
+			return false
+		}
+		a.moveCaretHorizontal(-1, false)
 	case tcell.KeyRight:
-		a.cursorX++
+		if hasWordSelectionModifier(ev.Modifiers()) {
+			a.moveCaretWord(1, true)
+			return false
+		}
+		if hasWordMoveModifier(ev.Modifiers()) {
+			a.moveCaretWord(1, false)
+			return false
+		}
+		if hasSelectionModifier(ev.Modifiers()) {
+			a.moveCaretHorizontal(1, true)
+			return false
+		}
+		a.moveCaretHorizontal(1, false)
+	case tcell.KeyHome:
+		a.moveToLineBoundary(true, hasSelectionModifier(ev.Modifiers()))
+		return false
+	case tcell.KeyEnd:
+		a.moveToLineBoundary(false, hasSelectionModifier(ev.Modifiers()))
+		return false
+	case tcell.KeyPgUp:
+		a.moveByPage(-1, hasSelectionModifier(ev.Modifiers()))
+		return false
+	case tcell.KeyPgDn:
+		a.moveByPage(1, hasSelectionModifier(ev.Modifiers()))
+		return false
 	case tcell.KeyEnter:
 		a.insertNewLine()
+		return false
+	case tcell.KeyCtrlC:
+		a.copySelection()
+		return false
+	case tcell.KeyCtrlX:
+		a.cutSelection()
+		return false
+	case tcell.KeyCtrlV:
+		a.pasteClipboard()
 		return false
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		a.backspaceEditor()
@@ -323,6 +393,10 @@ func (a *App) handleEditorKey(ev *tcell.EventKey) bool {
 }
 
 func (a *App) insertRune(r rune) {
+	if a.hasSelection() {
+		a.replaceSelection(string(r))
+		return
+	}
 	if a.currentLineLocked() {
 		a.handoff = handoffDenied
 		a.statusMessage = "Current line is locked and cannot be edited directly."
@@ -345,9 +419,51 @@ func (a *App) insertRune(r rune) {
 }
 
 func (a *App) insertString(text string) {
+	if a.hasSelection() {
+		a.replaceSelection(text)
+		return
+	}
+	if strings.Contains(text, "\n") {
+		a.insertTextAtCaret(text)
+		return
+	}
 	for _, r := range []rune(text) {
 		a.insertRune(r)
 	}
+}
+
+func (a *App) insertTextAtCaret(text string) {
+	if a.currentLineLocked() {
+		a.handoff = handoffDenied
+		a.statusMessage = "Current line is locked and cannot be edited directly."
+		return
+	}
+	content := a.tabs[a.activeTab].Content
+	originalY := a.cursorY
+	line := []rune(content[originalY])
+	before := string(line[:a.cursorX])
+	after := string(line[a.cursorX:])
+	parts := strings.Split(text, "\n")
+	updated := make([]string, 0, len(content)+len(parts)-1)
+	updated = append(updated, content[:originalY]...)
+	if len(parts) == 1 {
+		updated = append(updated, before+parts[0]+after)
+		a.cursorX += len([]rune(parts[0]))
+	} else {
+		updated = append(updated, before+parts[0])
+		for _, middle := range parts[1 : len(parts)-1] {
+			updated = append(updated, middle)
+		}
+		updated = append(updated, parts[len(parts)-1]+after)
+		a.shiftLockedLines(originalY+1, len(parts)-1)
+		a.cursorY = originalY + len(parts) - 1
+		a.cursorX = len([]rune(parts[len(parts)-1]))
+	}
+	updated = append(updated, content[originalY+1:]...)
+	a.tabs[a.activeTab].Content = updated
+	a.handoff = handoffHumanLed
+	a.statusMessage = "Inserted text in active edit surface."
+	a.ensureCursorInBounds()
 }
 
 func (a *App) indentUnit() string {
@@ -380,6 +496,10 @@ func (a *App) indentModeLabel() string {
 }
 
 func (a *App) insertNewLine() {
+	if a.hasSelection() {
+		a.replaceSelection("\n")
+		return
+	}
 	if a.currentLineLocked() {
 		a.handoff = handoffDenied
 		a.statusMessage = "Current line is locked and cannot be split."
@@ -409,7 +529,50 @@ func (a *App) insertNewLine() {
 	a.statusMessage = "Inserted a new line."
 }
 
+func (a *App) insertLineAbove() {
+	content := a.tabs[a.activeTab].Content
+	originalLine := a.cursorY
+	originalColumn := a.cursorX
+	updated := make([]string, 0, len(content)+1)
+	updated = append(updated, content[:a.cursorY]...)
+	updated = append(updated, "")
+	updated = append(updated, content[a.cursorY:]...)
+	a.tabs[a.activeTab].Content = updated
+	a.shiftLockedLines(a.cursorY, 1)
+	a.cursorY = originalLine + 1
+	a.cursorX = originalColumn
+	a.handoff = handoffHumanLed
+	a.statusMessage = fmt.Sprintf("Inserted a blank line above line %d while keeping the caret on its content line.", a.cursorY+1)
+}
+
+func (a *App) removeBlankLineAbove() {
+	if a.cursorY == 0 {
+		a.statusMessage = "There is no line above the cursor."
+		return
+	}
+	index := a.cursorY - 1
+	locked := a.tabs[a.activeTab].Locked
+	if locked != nil && locked[index] {
+		a.handoff = handoffDenied
+		a.statusMessage = "The line above is locked and cannot be removed."
+		return
+	}
+	if !isVisuallyBlank(a.tabs[a.activeTab].Content[index]) {
+		a.statusMessage = "The line above is not blank enough to remove."
+		return
+	}
+	a.tabs[a.activeTab].Content = append(a.tabs[a.activeTab].Content[:index], a.tabs[a.activeTab].Content[index+1:]...)
+	a.shiftLockedLines(a.cursorY, -1)
+	a.cursorY--
+	a.handoff = handoffHumanLed
+	a.statusMessage = fmt.Sprintf("Removed the blank line above line %d.", a.cursorY+1)
+}
+
 func (a *App) backspaceEditor() {
+	if a.hasSelection() {
+		a.replaceSelection("")
+		return
+	}
 	if a.currentLineLocked() {
 		a.handoff = handoffDenied
 		a.statusMessage = "Current line is locked and cannot be edited directly."
@@ -450,6 +613,10 @@ func (a *App) backspaceEditor() {
 }
 
 func (a *App) deleteEditor() {
+	if a.hasSelection() {
+		a.replaceSelection("")
+		return
+	}
 	if a.currentLineLocked() {
 		a.handoff = handoffDenied
 		a.statusMessage = "Current line is locked and cannot be edited directly."
@@ -628,7 +795,8 @@ func (a *App) saveCurrentTabState() {
 	tab := &a.tabs[a.activeTab]
 	tab.CursorX = a.cursorX
 	tab.CursorY = a.cursorY
-	tab.SelectionAnchor = a.selectionAnchor
+	tab.SelectionAnchorX = a.selectionAnchorX()
+	tab.SelectionAnchorY = a.selectionAnchor
 }
 
 func (a *App) loadCurrentTabState() {
@@ -638,68 +806,320 @@ func (a *App) loadCurrentTabState() {
 	tab := &a.tabs[a.activeTab]
 	a.cursorX = tab.CursorX
 	a.cursorY = tab.CursorY
-	a.selectionAnchor = tab.SelectionAnchor
+	a.setSelectionAnchor(tab.SelectionAnchorX, tab.SelectionAnchorY)
 	a.ensureCursorInBounds()
 	tab.CursorX = a.cursorX
 	tab.CursorY = a.cursorY
-	tab.SelectionAnchor = a.selectionAnchor
+	tab.SelectionAnchorX = a.selectionAnchorX()
+	tab.SelectionAnchorY = a.selectionAnchor
 }
 
 func (a *App) currentScope() string {
 	if start, end, ok := a.selectionRange(); ok {
-		if start == end {
-			return fmt.Sprintf("selection:L%d", start+1)
-		}
-		return fmt.Sprintf("selection:L%d-L%d", start+1, end+1)
+		return fmt.Sprintf("selection:L%d:C%d-L%d:C%d", start.y+1, start.x+1, end.y+1, end.x+1)
 	}
-	return fmt.Sprintf("cursor:L%d:C%d", a.cursorY+1, a.cursorX+1)
+	return fmt.Sprintf("caret:L%d:C%d", a.cursorY+1, a.cursorX+1)
 }
 
 func (a *App) hasSelection() bool {
-	return a.selectionAnchor >= 0
+	if a.selectionAnchor < 0 {
+		return false
+	}
+	return a.selectionAnchor != a.cursorY || a.selectionAnchorCol != a.cursorX
 }
 
-func (a *App) selectionRange() (int, int, bool) {
-	if !a.hasSelection() {
-		return 0, 0, false
+func (a *App) selectionAnchorX() int {
+	return a.selectionAnchorCol
+}
+
+func (a *App) setSelectionAnchor(x, y int) {
+	a.selectionAnchorCol = x
+	a.selectionAnchor = y
+}
+
+func compareTextPos(left, right textPos) int {
+	if left.y != right.y {
+		if left.y < right.y {
+			return -1
+		}
+		return 1
 	}
-	start := a.selectionAnchor
-	end := a.cursorY
-	if start > end {
+	if left.x < right.x {
+		return -1
+	}
+	if left.x > right.x {
+		return 1
+	}
+	return 0
+}
+
+func hasSelectionModifier(mod tcell.ModMask) bool {
+	return mod&(tcell.ModShift|tcell.ModAlt) != 0
+}
+
+func hasWordSelectionModifier(mod tcell.ModMask) bool {
+	return mod&tcell.ModCtrl != 0 && mod&(tcell.ModShift|tcell.ModAlt) != 0
+}
+
+func hasWordMoveModifier(mod tcell.ModMask) bool {
+	return mod&tcell.ModCtrl != 0
+}
+
+func (a *App) caretPos() textPos {
+	return textPos{x: a.cursorX, y: a.cursorY}
+}
+
+func (a *App) anchorPos() textPos {
+	return textPos{x: a.selectionAnchorCol, y: a.selectionAnchor}
+}
+
+func (a *App) selectionRange() (textPos, textPos, bool) {
+	if !a.hasSelection() {
+		return textPos{}, textPos{}, false
+	}
+	start := a.anchorPos()
+	end := a.caretPos()
+	if compareTextPos(start, end) > 0 {
 		start, end = end, start
 	}
 	return start, end, true
 }
 
+func (a *App) projectedLineRange() (int, int, bool) {
+	start, end, ok := a.selectionRange()
+	if !ok {
+		return 0, 0, false
+	}
+	return start.y, end.y, true
+}
+
+func (a *App) startSelectionIfNeeded() {
+	if a.selectionAnchor < 0 {
+		a.setSelectionAnchor(a.cursorX, a.cursorY)
+	}
+}
+
+func (a *App) moveCaretHorizontal(delta int, selecting bool) {
+	if selecting {
+		a.startSelectionIfNeeded()
+	} else if a.hasSelection() {
+		a.clearSelection("Selection cleared.")
+	}
+	line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
+	if delta < 0 {
+		if a.cursorX > 0 {
+			a.cursorX--
+		} else if a.cursorY > 0 {
+			a.cursorY--
+			a.cursorX = len([]rune(a.tabs[a.activeTab].Content[a.cursorY]))
+		}
+	} else if delta > 0 {
+		if a.cursorX < len(line) {
+			a.cursorX++
+		} else if a.cursorY < len(a.tabs[a.activeTab].Content)-1 {
+			a.cursorY++
+			a.cursorX = 0
+		}
+	}
+	a.ensureCursorInBounds()
+}
+
+func (a *App) moveCaretVertical(delta int, selecting bool) {
+	if selecting {
+		a.startSelectionIfNeeded()
+	} else if a.hasSelection() {
+		a.clearSelection("Selection cleared.")
+	}
+	a.cursorY += delta
+	a.ensureCursorInBounds()
+}
+
+func isWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+}
+
+func (a *App) moveCaretWord(direction int, selecting bool) {
+	if selecting {
+		a.startSelectionIfNeeded()
+	} else if a.hasSelection() {
+		a.clearSelection("Selection cleared.")
+	}
+	line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
+	if direction < 0 {
+		if a.cursorX == 0 {
+			return
+		}
+		index := a.cursorX
+		for index > 0 && !isWordRune(line[index-1]) {
+			index--
+		}
+		for index > 0 && isWordRune(line[index-1]) {
+			index--
+		}
+		a.cursorX = index
+		return
+	}
+	if a.cursorX >= len(line) {
+		return
+	}
+	index := a.cursorX
+	for index < len(line) && isWordRune(line[index]) {
+		index++
+	}
+	for index < len(line) && !isWordRune(line[index]) {
+		index++
+	}
+	a.cursorX = index
+}
+
+func (a *App) moveToLineBoundary(toStart bool, selecting bool) {
+	if selecting {
+		a.startSelectionIfNeeded()
+	} else if a.hasSelection() {
+		a.clearSelection("Selection cleared.")
+	}
+	if toStart {
+		a.cursorX = 0
+		return
+	}
+	a.cursorX = len([]rune(a.tabs[a.activeTab].Content[a.cursorY]))
+}
+
+func (a *App) moveByPage(direction int, selecting bool) {
+	if selecting {
+		a.startSelectionIfNeeded()
+	} else if a.hasSelection() {
+		a.clearSelection("Selection cleared.")
+	}
+	step := 12
+	a.cursorY += direction * step
+	a.ensureCursorInBounds()
+}
+
+func (a *App) selectionContains(pos textPos) bool {
+	start, end, ok := a.selectionRange()
+	if !ok {
+		return false
+	}
+	return compareTextPos(start, pos) <= 0 && compareTextPos(pos, end) < 0
+}
+
+func (a *App) selectedText() string {
+	start, end, ok := a.selectionRange()
+	if !ok {
+		return ""
+	}
+	content := a.tabs[a.activeTab].Content
+	if start.y == end.y {
+		line := []rune(content[start.y])
+		return string(line[start.x:end.x])
+	}
+	parts := make([]string, 0, end.y-start.y+1)
+	first := []rune(content[start.y])
+	parts = append(parts, string(first[start.x:]))
+	for index := start.y + 1; index < end.y; index++ {
+		parts = append(parts, content[index])
+	}
+	last := []rune(content[end.y])
+	parts = append(parts, string(last[:end.x]))
+	return strings.Join(parts, "\n")
+}
+
+func (a *App) replaceSelection(replacement string) {
+	start, end, ok := a.selectionRange()
+	if !ok {
+		return
+	}
+	content := a.tabs[a.activeTab].Content
+	first := []rune(content[start.y])
+	last := []rune(content[end.y])
+	before := string(first[:start.x])
+	after := string(last[end.x:])
+	replacementLines := strings.Split(replacement, "\n")
+	newLines := make([]string, 0, len(content)-(end.y-start.y)+len(replacementLines))
+	newLines = append(newLines, content[:start.y]...)
+	if len(replacementLines) == 1 {
+		newLines = append(newLines, before+replacementLines[0]+after)
+		a.cursorY = start.y
+		a.cursorX = len([]rune(before + replacementLines[0]))
+	} else {
+		newLines = append(newLines, before+replacementLines[0])
+		for _, line := range replacementLines[1 : len(replacementLines)-1] {
+			newLines = append(newLines, line)
+		}
+		newLines = append(newLines, replacementLines[len(replacementLines)-1]+after)
+		a.cursorY = start.y + len(replacementLines) - 1
+		a.cursorX = len([]rune(replacementLines[len(replacementLines)-1]))
+	}
+	newLines = append(newLines, content[end.y+1:]...)
+	a.tabs[a.activeTab].Content = newLines
+	a.clearSelection("Selection replaced.")
+	a.ensureCursorInBounds()
+	if replacement == "" {
+		a.statusMessage = "Deleted selected text."
+	} else {
+		a.statusMessage = "Inserted text in active edit surface."
+	}
+}
+
+func (a *App) copySelection() {
+	if !a.hasSelection() {
+		a.statusMessage = "No selection to copy."
+		return
+	}
+	a.clipboard = a.selectedText()
+	a.statusMessage = "Copied selection."
+}
+
+func (a *App) cutSelection() {
+	if !a.hasSelection() {
+		a.statusMessage = "No selection to cut."
+		return
+	}
+	a.clipboard = a.selectedText()
+	a.replaceSelection("")
+	a.statusMessage = "Cut selection."
+}
+
+func (a *App) pasteClipboard() {
+	if a.clipboard == "" {
+		a.statusMessage = "Clipboard is empty."
+		return
+	}
+	a.insertString(a.clipboard)
+	a.statusMessage = "Pasted clipboard at caret."
+}
+
 func (a *App) clearSelection(message string) {
 	a.selectionAnchor = -1
+	a.selectionAnchorCol = 0
 	a.handoff = handoffHumanLed
 	a.statusMessage = message
 }
 
 func (a *App) expandSelection(delta int) {
 	if !a.hasSelection() {
-		a.selectionAnchor = a.cursorY
+		a.setSelectionAnchor(a.cursorX, a.cursorY)
 	}
 	a.cursorY += delta
 	a.ensureCursorInBounds()
 	a.handoff = handoffHumanLed
 	start, end, _ := a.selectionRange()
-	if start == end {
-		a.statusMessage = fmt.Sprintf("Selection anchored on line %d.", start+1)
+	if compareTextPos(start, end) == 0 {
+		a.statusMessage = fmt.Sprintf("Selection anchored on line %d.", start.y+1)
 		return
 	}
-	a.statusMessage = fmt.Sprintf("Selection spans lines %d-%d.", start+1, end+1)
+	a.statusMessage = fmt.Sprintf("Selection spans lines %d-%d.", start.y+1, end.y+1)
 }
 
 func (a *App) moveSelectedBlock(delta int) {
 	if delta == 0 {
 		return
 	}
-	start, end, ok := a.selectionRange()
+	start, end, ok := a.projectedLineRange()
 	if !ok {
-		a.selectionAnchor = a.cursorY
-		start, end, _ = a.selectionRange()
+		a.setSelectionAnchor(a.cursorX, a.cursorY)
+		start, end, _ = a.projectedLineRange()
 	}
 
 	content := a.tabs[a.activeTab].Content
@@ -753,7 +1173,7 @@ func (a *App) moveSelectedBlock(delta int) {
 
 	a.tabs[a.activeTab].Content = content
 	a.applyLockedFlags(flags)
-	a.selectionAnchor = start
+	a.setSelectionAnchor(a.selectionAnchorX(), start)
 	a.cursorY = end
 	a.ensureCursorInBounds()
 	a.handoff = handoffHumanLed
@@ -789,7 +1209,7 @@ func (a *App) rangeLocked(start, end int, flags []bool) bool {
 }
 
 func (a *App) activeLineRange() (int, int) {
-	if start, end, ok := a.selectionRange(); ok {
+	if start, end, ok := a.projectedLineRange(); ok {
 		return start, end
 	}
 	return a.cursorY, a.cursorY
@@ -858,7 +1278,7 @@ func (a *App) selectCodeBlock() {
 		return
 	}
 
-	currentStart, currentEnd, hasSelection := a.selectionRange()
+	currentStart, currentEnd, hasSelection := a.projectedLineRange()
 	delimiterCandidates := uniqueSortedRanges(a.delimiterBlockCandidates(content))
 	indentCandidates := uniqueSortedRanges(a.indentBlockCandidates(content))
 	candidates := delimiterCandidates
@@ -872,7 +1292,8 @@ func (a *App) selectCodeBlock() {
 		candidates = indentCandidates
 	}
 	if len(candidates) == 0 {
-		a.selectionAnchor = a.cursorY
+		a.setSelectionAnchor(0, a.cursorY)
+		a.cursorX = len([]rune(a.tabs[a.activeTab].Content[a.cursorY]))
 		a.handoff = handoffHumanLed
 		a.statusMessage = fmt.Sprintf("No enclosing block found; selected line %d.", a.cursorY+1)
 		return
@@ -881,13 +1302,15 @@ func (a *App) selectCodeBlock() {
 	if !hasSelection {
 		candidate, ok := a.smallestBlockForLine(candidates, a.cursorY)
 		if !ok {
-			a.selectionAnchor = a.cursorY
+			a.setSelectionAnchor(0, a.cursorY)
+			a.cursorX = len([]rune(a.tabs[a.activeTab].Content[a.cursorY]))
 			a.handoff = handoffHumanLed
 			a.statusMessage = fmt.Sprintf("No enclosing block found; selected line %d.", a.cursorY+1)
 			return
 		}
-		a.selectionAnchor = candidate.start
+		a.setSelectionAnchor(0, candidate.start)
 		a.cursorY = candidate.end
+		a.cursorX = len([]rune(a.tabs[a.activeTab].Content[a.cursorY]))
 		a.ensureCursorInBounds()
 		a.handoff = handoffHumanLed
 		a.statusMessage = fmt.Sprintf("Selected code block lines %d-%d.", candidate.start+1, candidate.end+1)
@@ -895,8 +1318,9 @@ func (a *App) selectCodeBlock() {
 	}
 
 	if candidate, ok := a.nextEnclosingBlock(candidates, currentStart, currentEnd); ok {
-		a.selectionAnchor = candidate.start
+		a.setSelectionAnchor(0, candidate.start)
 		a.cursorY = candidate.end
+		a.cursorX = len([]rune(a.tabs[a.activeTab].Content[a.cursorY]))
 		a.ensureCursorInBounds()
 		a.handoff = handoffHumanLed
 		a.statusMessage = fmt.Sprintf("Expanded to parent block lines %d-%d.", candidate.start+1, candidate.end+1)
@@ -1130,6 +1554,10 @@ func (a *App) removeSingleIndent(line string) (string, int) {
 	return line[spaces:], spaces
 }
 
+func isVisuallyBlank(line string) bool {
+	return strings.Trim(line, " \t") == ""
+}
+
 func looksLikeBlockHeader(trimmed string) bool {
 	if trimmed == "" {
 		return false
@@ -1254,9 +1682,9 @@ func (a *App) drawEditSurface(x, y, width, height int) {
 		line := trimRunes(content[i], width-5)
 		gutter, style := a.lineVisual(i)
 		a.drawText(x+1, lineY, styleGutter(), gutter)
-		a.drawTextWithVisibleTabs(x+4, lineY, style, line)
+		a.drawTextWithVisibleTabs(x+4, lineY, i, style, line)
 	}
-	footer := fmt.Sprintf("Focus:%s  Scope:%s  Indent:[Tab/Shift+Tab]  Width:[Alt+1..4]  Tabs:[Alt+,/Alt+. or Ctrl+Tab/Ctrl+Shift+Tab]  Block:[F2/Ctrl+Space/Ctrl+[]  Move:[Ctrl+Up/Down]  Control:[Ctrl+G]  Quit:[Ctrl+C]", a.focusLabel(), a.currentScope())
+	footer := fmt.Sprintf("Focus:%s  Scope:%s  Indent:[Tab/Shift+Tab]  Width:[Alt+0..4]  Tabs:[Alt+,/Alt+. or Ctrl+Tab/Ctrl+Shift+Tab]  Block:[F2/Ctrl+Space/Ctrl+[]  Ctrl+Up/Down:[line or block]  Control:[Ctrl+G]  Quit:[Ctrl+Q]", a.focusLabel(), a.currentScope())
 	if a.helpVisible {
 		footer = fmt.Sprintf("Focus:%s  Scope:%s  Help:[Esc closes]", a.focusLabel(), a.currentScope())
 	}
@@ -1347,11 +1775,21 @@ func (a *App) drawHelpDialog(screenWidth, screenHeight int) {
 		"  F2               select current block, then parent block",
 		"  Ctrl+Space       same intent, but some terminals drop it",
 		"  Ctrl+[           same intent, but some terminals treat it as Esc",
+		"  Ctrl+Down        insert a blank line above, or move selected block",
+		"  Ctrl+Up          remove a blank line above, or move selected block",
+		"  Home / End       move caret to start or end of line",
+		"  PageUp / PageDn  move caret by larger vertical steps",
 		"  Ctrl+G           focus control hub",
-		"  Alt+Up/Down      grow or shrink line selection",
-		"  Shift+Up/Down    fallback selection keys",
+		"  Shift/Alt+Arrow  expand or shrink text selection",
+		"  Ctrl+Arrow       move caret by word",
+		"  Ctrl+Shift/Alt   select by word with Left/Right",
+		"  Shift/Alt+Home   select to line start",
+		"  Shift/Alt+End    select to line end",
+		"  Shift/Alt+Page   select by larger vertical steps",
+		"  Ctrl+C / Ctrl+X  copy or cut selection",
+		"  Ctrl+V           paste clipboard at caret",
 		"  Ctrl+Up/Down     swap selected block with adjacent line",
-		"  Ctrl+C           open quit confirmation",
+		"  Ctrl+Q           open quit confirmation",
 		"",
 		"Control hub",
 		"  Type a short command, then press Enter for preview.",
@@ -1361,7 +1799,7 @@ func (a *App) drawHelpDialog(screenWidth, screenHeight int) {
 		"",
 		"Cowork states",
 		"  L! locked region   P> proposal   R? review-needed",
-		"  H* human-selected  A+ approved   X! denied",
+		"  caret-range text selection   A+ approved   X! denied",
 	}
 
 	maxLen := 0
@@ -1402,8 +1840,8 @@ func (a *App) drawQuitDialog(screenWidth, screenHeight int) {
 	lines := []string{
 		"Quit gdedit?",
 		"",
-		"Ctrl+C often means copy muscle memory in terminal apps.",
-		"To avoid accidental exits, gdedit asks before quitting.",
+		"Ctrl+Q is the dedicated quit key.",
+		"gdedit still asks before quitting to avoid accidental exits.",
 		"",
 		"Press Enter or y to exit.",
 		"Press Esc or n to return to the editor.",
@@ -1486,9 +1924,6 @@ func (a *App) lineVisual(index int) (string, tcell.Style) {
 			return "A+ ", styleApproved()
 		}
 	}
-	if start, end, ok := a.selectionRange(); ok && index >= start && index <= end {
-		return "H* ", styleSelection()
-	}
 	if index == a.cursorY {
 		return ">  ", styleCursorLine()
 	}
@@ -1532,13 +1967,19 @@ func (a *App) drawText(x, y int, style tcell.Style, text string) {
 	}
 }
 
-func (a *App) drawTextWithVisibleTabs(x, y int, style tcell.Style, text string) {
+func (a *App) drawTextWithVisibleTabs(x, y, lineIndex int, style tcell.Style, text string) {
 	for i, r := range []rune(text) {
 		cellRune := r
 		cellStyle := style
+		if a.selectionContains(textPos{x: i, y: lineIndex}) {
+			cellStyle = styleSelection()
+		}
 		if r == '\t' {
 			cellRune = []rune(tabGlyph)[0]
 			cellStyle = styleTabGlyph()
+			if a.selectionContains(textPos{x: i, y: lineIndex}) {
+				cellStyle = styleSelection()
+			}
 		}
 		a.screen.SetContent(x+i, y, cellRune, nil, cellStyle)
 	}

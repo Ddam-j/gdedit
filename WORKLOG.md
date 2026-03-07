@@ -91,12 +91,26 @@
 ## Post-Phase 6 Usability Refinement
 
 - Reworked the editor keymap so printable characters are no longer stolen by mnemonic shortcuts.
-- Added a visible help flow (`F1` / `Esc`) and a quit confirmation flow on `Ctrl+C`.
+- Added a visible help flow (`F1` / `Esc`) and a quit confirmation flow on `Ctrl+Q`.
 - Added direct editor mutations for insert, delete, newline split, merge, and visible caret handling.
 - Added example tabs for Go, Python, TypeScript, and YAML so block-selection behavior can be tested in-place.
 - Added hierarchical block selection with a terminal-safe default on `F2`; `Ctrl+[` and `Ctrl+Space` remain best-effort aliases.
 - Scoped cursor and selection state per tab so tab switching preserves the active tab's own selection instead of leaking selection across tabs.
 - Moved tab navigation to `Alt+.` and `Alt+,` because `Ctrl+Tab` is unreliable in many terminal stacks.
+- Rebuilt the selection model around character-range selection instead of line-only selection.
+- Structured edit operations now project the active text selection to covered lines for indent/outdent and block movement.
+- Added terminal-safe clipboard editing:
+  - `Ctrl+C` copies the selected text.
+  - `Ctrl+X` cuts the selected text.
+  - `Ctrl+V` pastes at the caret or replaces the current selection.
+  - multiline paste creates real lines.
+- Added richer keyboard movement:
+  - `Home` / `End`
+  - `PageUp` / `PageDown`
+  - `Ctrl+Left` / `Ctrl+Right` word movement
+  - `Ctrl+Shift+Left` / `Ctrl+Shift+Right` word selection
+  - `Ctrl+Alt+Left` / `Ctrl+Alt+Right` word-movement fallback
+- Normalized terminal selection modifiers so `Shift`, `Alt`, and `Shift+Alt` all extend selection on supported movement keys.
 - Changed indentation policy to user-directed editing:
   - `Tab` inserts a literal `\t` when there is no selection.
   - `Tab` indents only the active selection.
@@ -104,3 +118,6 @@
   - `Alt+0` switches selection indentation to literal tabs.
   - `Alt+1` through `Alt+4` switch selection indentation to 1-4 spaces.
 - Split stored tab characters from displayed tab markers: literal `\t` is saved in the buffer, but renders as a styled `»` marker in the edit surface.
+- Added safety behavior for structural editing:
+  - `Ctrl+Up` / `Ctrl+Down` edit lines when no selection exists and move blocks when a selection exists.
+  - `Ctrl+Alt+Up` / `Ctrl+Alt+Down` are explicitly disabled to avoid accidental swaps.
