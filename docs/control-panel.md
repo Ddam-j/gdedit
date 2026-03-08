@@ -2,11 +2,11 @@
 
 ## Purpose
 
-This document defines the behavior of the `gdedit` control panel, also called the control hub. It is the primary path for explicit control, agent invocation, command preview, and voice-to-command flow.
+This document defines the behavior of the `gdedit` control panel, also called the control hub. It is the primary path for editing-focused control, edit-agent interaction, command preview, and voice-to-command flow.
 
 ## Core Definition
 
-- The control panel is the single representative control hub of `gdedit`.
+- The control panel is the single scoped control hub of `gdedit`.
 - Control mode is experienced as the control panel being focused.
 - The control panel is not a detached command world; it is a context-aware entry point into the current editing surface.
 
@@ -16,8 +16,29 @@ This document defines the behavior of the `gdedit` control panel, also called th
 - accept voice-injected text
 - show command intent before execution
 - route actions to the current editing context
-- expose preview, confirmation, and review flow
-- provide a stable place for agent invocation
+- expose preview and confirmation against the current scope
+- provide a stable place for edit-agent interaction tied to the current text scope
+
+## Product Focus
+
+The control hub is not meant to become a generic external-agent orchestration surface.
+
+- its near-term role is editing-first assistance
+- it should stay close to files, selections, caret positions, and explicit user intent
+- external-agent mediation can be added later on top of durable text artifacts rather than replacing the editing-first core
+
+In practical terms, the control hub should feel like a text-file secretary for the current workspace.
+
+- it helps interpret file meaning in local context
+- it helps the user leave durable notes about a file or scope
+- it helps prepare text artifacts that can later be used for outside-agent delegation
+- it is especially valuable for code, config, notes, and skill files where local intent matters
+
+Memo destinations should follow file character.
+
+- system and app setup memos should go under the system memo root configured in `~/.config/gdedit/config.json`
+- project-specific memos should be stored inside the relevant project's `.gdedit/` directory
+- both kinds should stay plain-text, portable, and structured enough for AI models to read and use for later execution
 
 ## Focus Model
 
@@ -48,7 +69,7 @@ Base flow:
 3. `gdedit` resolves scope from visible context
 4. the command is previewed or shown in actionable form
 5. the user confirms, edits, or cancels
-6. the result is routed back into the active editing context
+6. the result is routed back into the active editing context or into a durable text artifact related to that context
 
 ## Scope Resolution Rules
 
@@ -72,7 +93,7 @@ Voice is a control-panel input path, not a parallel system.
 - the user may correct the text before confirming
 - direct blind execution is not the default
 
-This keeps voice deliberate, reviewable, and aligned with the control philosophy.
+This keeps voice deliberate, scope-aware, and aligned with the control philosophy.
 
 ## Canonical Command Categories
 
@@ -85,18 +106,25 @@ Phase 1 should keep the command set small and legible.
 - insert project name here
 - add TODO here
 
-### Agent Invocation
+### File Understanding / Memo
+
+- explain what this file is for
+- note why this setting exists
+- save my memo about this block
+- write a handoff note for this file
+- summarize what this config changes
+
+### Edit-Agent Interaction
 
 - inspect recent change
 - suggest a patch for this selection
-- show agent draft
+- explain this scope before editing
 
-### Scope / Review
+### Scope / Confirmation
 
 - show diff only
 - highlight impact range
-- hold for review
-- approve this proposal
+- target current scope
 
 ### Navigation / Context
 
@@ -106,20 +134,23 @@ Phase 1 should keep the command set small and legible.
 
 ## Command Language Style
 
-The control panel favors short, context-aware intent rather than long chat prompts.
+The control panel favors short, context-aware editing intent rather than long chat prompts.
 
 Good qualities:
 
 - short
 - local
 - scope-aware
-- preview-friendly
+- scope-first
+- file-aware
+- artifact-friendly
 
 Bad qualities:
 
 - broad whole-project ambiguity by default
 - detached prompt style with no visible target
-- opaque execution with no review path
+- opaque execution with no visible scope
+- generic assistant chatter detached from the current file
 
 ## Preview-First Principle
 
@@ -128,7 +159,7 @@ The control panel should prefer preview-before-execute when:
 - scope is ambiguous
 - impact is non-local
 - the edit touches multiple ranges
-- the user is invoking an agent-generated patch
+- the user wants to verify the current scope before acting
 
 Immediate execution is acceptable only for clearly bounded, low-risk actions.
 
@@ -137,13 +168,16 @@ Immediate execution is acceptable only for clearly bounded, low-risk actions.
 - the control panel is where the user expresses intent
 - the status surface is where `gdedit` summarizes state and result
 
+The control hub may also initiate writing to dedicated text artifacts when that helps preserve user intent, such as file notes, handoff memos, or structured assistant-facing summaries.
+
 The control panel should not absorb status responsibilities, and the status surface should not turn into a second command system.
 
 ## Relationship to the Edit Agent
 
 - the control panel is the main entry point for explicit edit-agent requests
-- the agent should return suggestions, previews, or patches that remain reviewable
+- the agent should work against the visible current scope
 - the control panel should be able to represent the current target scope before the agent acts
+- the first-class relationship is between editing control and the edit agent, not between the user and a generic remote orchestration layer
 
 ## Layout Role
 
@@ -161,6 +195,7 @@ This aligns with the product direction that the left side feels like the place w
 - no giant chat transcript as the main control UI
 - no command model that ignores cursor, selection, and active tab
 - no hidden automatic broad rewrite path
+- no product drift toward a generic multi-agent console before the editing assistant core is solid
 
 ## Phase 1 Acceptance
 

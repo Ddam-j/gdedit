@@ -1,13 +1,32 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
+	"gdedit/internal/agent"
+	"gdedit/internal/config"
+	"gdedit/internal/memo"
+	sysclipboard "github.com/atotto/clipboard"
 	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/uniseg"
+	"golang.org/x/text/unicode/norm"
 )
+
+var clipboardRead = func() (string, error) {
+	return sysclipboard.ReadAll()
+}
+
+var clipboardWrite = func(text string) error {
+	return sysclipboard.WriteAll(text)
+}
 
 const (
 	minWidth      = 60
@@ -15,6 +34,15 @@ const (
 	defaultIndent = 2
 	tabGlyph      = "»"
 )
+
+var spinnerFrames = []string{"-", "\\", "|", "/"}
+
+type spinnerTick struct{}
+
+type controlExecutionResult struct {
+	response agent.Response
+	err      error
+}
 
 type focusArea int
 
@@ -25,29 +53,15 @@ const (
 
 type Tab struct {
 	Title            string
+	FilePath         string
 	Content          []string
 	Locked           map[int]bool
+	ViewTop          int
+	ViewLeft         int
 	CursorX          int
 	CursorY          int
 	SelectionAnchorX int
 	SelectionAnchorY int
-}
-
-type handoffState string
-
-const (
-	handoffHumanLed      handoffState = "human-led"
-	handoffAgentSuggest  handoffState = "agent-suggesting"
-	handoffReviewPending handoffState = "review-pending"
-	handoffApplying      handoffState = "applying"
-	handoffDenied        handoffState = "locked/denied"
-)
-
-type reviewItem struct {
-	ID     string
-	Action string
-	Target string
-	State  handoffState
 }
 
 type lineRange struct {
@@ -61,97 +75,168 @@ type textPos struct {
 }
 
 type App struct {
-	screen             tcell.Screen
-	tabs               []Tab
-	activeTab          int
-	focus              focusArea
-	controlInput       []rune
-	controlCursor      int
-	preview            Preview
-	cursorX            int
-	cursorY            int
-	selectionAnchorCol int
-	selectionAnchor    int
-	statusMessage      string
-	voiceState         string
-	reviewCount        int
-	handoff            handoffState
-	reviewItems        []reviewItem
-	lastApplied        string
-	helpVisible        bool
-	quitConfirm        bool
-	indentWidth        int
-	clipboard          string
+	screen               tcell.Screen
+	tabs                 []Tab
+	activeTab            int
+	focus                focusArea
+	controlInput         []rune
+	controlCursor        int
+	controlSelectAnchor  int
+	controlViewportLeft  int
+	controlViewportWidth int
+	preview              Preview
+	cursorX              int
+	cursorY              int
+	selectionAnchorCol   int
+	selectionAnchor      int
+	statusMessage        string
+	lastAgentReply       string
+	lastAgentResult      string
+	voiceState           string
+	lastCommand          string
+	helpVisible          bool
+	quitConfirm          bool
+	indentWidth          int
+	clipboard            string
+	agentProfile         string
+	agentExecutor        agent.Executor
+	workspaceRoot        string
+	systemMemoRoot       string
+	agentRunning         bool
+	spinnerIndex         int
+	spinnerStop          chan struct{}
+	viewportTop          int
+	editorViewportHeight int
+	viewportLeft         int
+	editorViewportWidth  int
 }
 
 func New() *App {
+	return NewWithAgent("", nil, "", "")
+}
+
+func NewWithAgentProfile(agentProfile string) *App {
+	return NewWithAgent(agentProfile, nil, "", "")
+}
+
+func NewWithAgent(agentProfile string, executor agent.Executor, workspaceRoot, systemMemoRoot string) *App {
 	return &App{
-		tabs: []Tab{
-			{
-				Title: "main.go",
-				Content: []string{
-					"package main",
-					"",
-					"func route(input string) string {",
-					"\tif input == \"agent\" {",
-					"		return buildReply(input)",
-					"	}",
-					"	return fallback(input)",
-					"}",
-				},
-				Locked:           map[int]bool{0: true, 2: true},
-				SelectionAnchorY: -1,
-			},
-			{
-				Title: "worker.py",
-				Content: []string{
-					"def transform(task):",
-					"    if task.ready:",
-					"        for step in task.steps:",
-					"            if step.enabled:",
-					"                return step.name",
-					"    return \"idle\"",
-				},
-				Locked:           map[int]bool{0: true},
-				SelectionAnchorY: -1,
-			},
-			{
-				Title: "panel.ts",
-				Content: []string{
-					"export function buildPanel(state: EditorState) {",
-					"  if (state.mode === \"review\") {",
-					"    return {",
-					"      title: \"Review Queue\",",
-					"      items: state.items.map((item) => item.label),",
-					"    }",
-					"  }",
-					"  return { title: \"Editor\", items: [] }",
-					"}",
-				},
-				Locked:           map[int]bool{0: true},
-				SelectionAnchorY: -1,
-			},
-			{
-				Title: "config.yaml",
-				Content: []string{
-					"workstyle:",
-					"  name: focused-review",
-					"  shortcuts:",
-					"    select_block: ctrl-[",
-					"    move_block_up: ctrl-up",
-					"    move_block_down: ctrl-down",
-				},
-				Locked:           map[int]bool{0: true},
-				SelectionAnchorY: -1,
-			},
-		},
-		focus:           focusEditor,
-		selectionAnchor: -1,
-		statusMessage:   "Ready. Ctrl+G focuses the control hub.",
-		voiceState:      "off",
-		handoff:         handoffHumanLed,
-		indentWidth:     defaultIndent,
+		tabs:                sampleTabs(),
+		focus:               focusEditor,
+		selectionAnchor:     -1,
+		controlSelectAnchor: -1,
+		statusMessage:       "Ready. Ctrl+G focuses the control hub.",
+		voiceState:          "off",
+		indentWidth:         defaultIndent,
+		agentProfile:        agentProfile,
+		agentExecutor:       executor,
+		workspaceRoot:       workspaceRoot,
+		systemMemoRoot:      systemMemoRoot,
 	}
+}
+
+func NewWithFiles(agentProfile string, executor agent.Executor, workspaceRoot, systemMemoRoot string, filePaths []string) (*App, error) {
+	app := NewWithAgent(agentProfile, executor, workspaceRoot, systemMemoRoot)
+	if len(filePaths) == 0 {
+		return app, nil
+	}
+	tabs, err := loadTabsFromPaths(filePaths)
+	if err != nil {
+		return nil, err
+	}
+	app.tabs = tabs
+	return app, nil
+}
+
+func sampleTabs() []Tab {
+	return []Tab{
+		{
+			Title: "main.go",
+			Content: []string{
+				"package main",
+				"",
+				"func route(input string) string {",
+				"\tif input == \"agent\" {",
+				"		return buildReply(input)",
+				"	}",
+				"	return fallback(input)",
+				"}",
+			},
+			SelectionAnchorY: -1,
+		},
+		{
+			Title: "worker.py",
+			Content: []string{
+				"def transform(task):",
+				"    if task.ready:",
+				"        for step in task.steps:",
+				"            if step.enabled:",
+				"                return step.name",
+				"    return \"idle\"",
+			},
+			SelectionAnchorY: -1,
+		},
+		{
+			Title: "panel.ts",
+			Content: []string{
+				"export function buildPanel(state: EditorState) {",
+				"  if (state.mode === \"review\") {",
+				"    return {",
+				"      title: \"Review Queue\",",
+				"      items: state.items.map((item) => item.label),",
+				"    }",
+				"  }",
+				"  return { title: \"Editor\", items: [] }",
+				"}",
+			},
+			SelectionAnchorY: -1,
+		},
+		{
+			Title: "config.yaml",
+			Content: []string{
+				"workstyle:",
+				"  name: focused-review",
+				"  shortcuts:",
+				"    select_block: ctrl-[",
+				"    move_block_up: ctrl-up",
+				"    move_block_down: ctrl-down",
+			},
+			SelectionAnchorY: -1,
+		},
+	}
+}
+
+func loadTabsFromPaths(filePaths []string) ([]Tab, error) {
+	tabs := make([]Tab, 0, len(filePaths))
+	for _, path := range filePaths {
+		expandedPath, err := config.ExpandUserPath(path)
+		if err != nil {
+			return nil, err
+		}
+		absPath, err := filepath.Abs(filepath.FromSlash(expandedPath))
+		if err != nil {
+			return nil, err
+		}
+		content, err := os.ReadFile(absPath)
+		if err != nil {
+			return nil, err
+		}
+		text := strings.ReplaceAll(string(content), "\r\n", "\n")
+		lines := strings.Split(text, "\n")
+		if len(lines) == 0 {
+			lines = []string{""}
+		}
+		if len(lines) > 1 && lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+		tabs = append(tabs, Tab{
+			Title:            filepath.Base(absPath),
+			FilePath:         absPath,
+			Content:          lines,
+			SelectionAnchorY: -1,
+		})
+	}
+	return tabs, nil
 }
 
 func (a *App) Run() (err error) {
@@ -182,11 +267,24 @@ func (a *App) Run() (err error) {
 		switch ev := event.(type) {
 		case *tcell.EventResize:
 			screen.Sync()
+		case *tcell.EventInterrupt:
+			a.handleInterrupt(ev)
 		case *tcell.EventKey:
 			if quit := a.handleKey(ev); quit {
 				return nil
 			}
 		}
+	}
+}
+
+func (a *App) handleInterrupt(ev *tcell.EventInterrupt) {
+	switch data := ev.Data().(type) {
+	case spinnerTick:
+		if a.agentRunning {
+			a.spinnerIndex = (a.spinnerIndex + 1) % len(spinnerFrames)
+		}
+	case controlExecutionResult:
+		a.finishControlExecution(data)
 	}
 }
 
@@ -249,7 +347,6 @@ func (a *App) handleEditorKey(ev *tcell.EventKey) bool {
 	case tcell.KeyCtrlG:
 		a.focus = focusControl
 		a.voiceState = "ready"
-		a.handoff = handoffAgentSuggest
 		a.statusMessage = "Control hub focused. Type a command and press Enter for preview."
 		return false
 	case tcell.KeyTab:
@@ -355,6 +452,9 @@ func (a *App) handleEditorKey(ev *tcell.EventKey) bool {
 	case tcell.KeyEnter:
 		a.insertNewLine()
 		return false
+	case tcell.KeyCtrlA:
+		a.selectAllEditor()
+		return false
 	case tcell.KeyCtrlC:
 		a.copySelection()
 		return false
@@ -383,6 +483,8 @@ func (a *App) handleEditorKey(ev *tcell.EventKey) bool {
 				a.setIndentWidth(int(ev.Rune() - '0'))
 				return false
 			}
+			a.statusMessage = "Unhandled Alt-modified key was ignored."
+			return false
 		}
 		a.insertRune(ev.Rune())
 		return false
@@ -397,11 +499,6 @@ func (a *App) insertRune(r rune) {
 		a.replaceSelection(string(r))
 		return
 	}
-	if a.currentLineLocked() {
-		a.handoff = handoffDenied
-		a.statusMessage = "Current line is locked and cannot be edited directly."
-		return
-	}
 
 	line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
 	if a.cursorX < 0 {
@@ -412,9 +509,8 @@ func (a *App) insertRune(r rune) {
 	}
 
 	line = append(line[:a.cursorX], append([]rune{r}, line[a.cursorX:]...)...)
+	line, a.cursorX = normalizeInsertedRunes(line, a.cursorX+1)
 	a.tabs[a.activeTab].Content[a.cursorY] = string(line)
-	a.cursorX++
-	a.handoff = handoffHumanLed
 	a.statusMessage = "Inserted text in active edit surface."
 }
 
@@ -433,11 +529,6 @@ func (a *App) insertString(text string) {
 }
 
 func (a *App) insertTextAtCaret(text string) {
-	if a.currentLineLocked() {
-		a.handoff = handoffDenied
-		a.statusMessage = "Current line is locked and cannot be edited directly."
-		return
-	}
 	content := a.tabs[a.activeTab].Content
 	originalY := a.cursorY
 	line := []rune(content[originalY])
@@ -455,13 +546,11 @@ func (a *App) insertTextAtCaret(text string) {
 			updated = append(updated, middle)
 		}
 		updated = append(updated, parts[len(parts)-1]+after)
-		a.shiftLockedLines(originalY+1, len(parts)-1)
 		a.cursorY = originalY + len(parts) - 1
 		a.cursorX = len([]rune(parts[len(parts)-1]))
 	}
 	updated = append(updated, content[originalY+1:]...)
 	a.tabs[a.activeTab].Content = updated
-	a.handoff = handoffHumanLed
 	a.statusMessage = "Inserted text in active edit surface."
 	a.ensureCursorInBounds()
 }
@@ -500,11 +589,6 @@ func (a *App) insertNewLine() {
 		a.replaceSelection("\n")
 		return
 	}
-	if a.currentLineLocked() {
-		a.handoff = handoffDenied
-		a.statusMessage = "Current line is locked and cannot be split."
-		return
-	}
 
 	line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
 	if a.cursorX < 0 {
@@ -522,10 +606,8 @@ func (a *App) insertNewLine() {
 	updated = append(updated, before, after)
 	updated = append(updated, content[a.cursorY+1:]...)
 	a.tabs[a.activeTab].Content = updated
-	a.shiftLockedLines(a.cursorY+1, 1)
 	a.cursorY++
 	a.cursorX = 0
-	a.handoff = handoffHumanLed
 	a.statusMessage = "Inserted a new line."
 }
 
@@ -538,10 +620,8 @@ func (a *App) insertLineAbove() {
 	updated = append(updated, "")
 	updated = append(updated, content[a.cursorY:]...)
 	a.tabs[a.activeTab].Content = updated
-	a.shiftLockedLines(a.cursorY, 1)
 	a.cursorY = originalLine + 1
 	a.cursorX = originalColumn
-	a.handoff = handoffHumanLed
 	a.statusMessage = fmt.Sprintf("Inserted a blank line above line %d while keeping the caret on its content line.", a.cursorY+1)
 }
 
@@ -551,20 +631,12 @@ func (a *App) removeBlankLineAbove() {
 		return
 	}
 	index := a.cursorY - 1
-	locked := a.tabs[a.activeTab].Locked
-	if locked != nil && locked[index] {
-		a.handoff = handoffDenied
-		a.statusMessage = "The line above is locked and cannot be removed."
-		return
-	}
 	if !isVisuallyBlank(a.tabs[a.activeTab].Content[index]) {
 		a.statusMessage = "The line above is not blank enough to remove."
 		return
 	}
 	a.tabs[a.activeTab].Content = append(a.tabs[a.activeTab].Content[:index], a.tabs[a.activeTab].Content[index+1:]...)
-	a.shiftLockedLines(a.cursorY, -1)
 	a.cursorY--
-	a.handoff = handoffHumanLed
 	a.statusMessage = fmt.Sprintf("Removed the blank line above line %d.", a.cursorY+1)
 }
 
@@ -573,18 +645,12 @@ func (a *App) backspaceEditor() {
 		a.replaceSelection("")
 		return
 	}
-	if a.currentLineLocked() {
-		a.handoff = handoffDenied
-		a.statusMessage = "Current line is locked and cannot be edited directly."
-		return
-	}
 
 	if a.cursorX > 0 {
 		line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
 		line = append(line[:a.cursorX-1], line[a.cursorX:]...)
 		a.tabs[a.activeTab].Content[a.cursorY] = string(line)
 		a.cursorX--
-		a.handoff = handoffHumanLed
 		a.statusMessage = "Deleted previous character."
 		return
 	}
@@ -594,21 +660,12 @@ func (a *App) backspaceEditor() {
 	}
 
 	prevIndex := a.cursorY - 1
-	locked := a.tabs[a.activeTab].Locked
-	if locked != nil && locked[prevIndex] {
-		a.handoff = handoffDenied
-		a.statusMessage = "Previous line is locked and cannot be merged."
-		return
-	}
-
 	prev := a.tabs[a.activeTab].Content[prevIndex]
 	current := a.tabs[a.activeTab].Content[a.cursorY]
 	a.tabs[a.activeTab].Content[prevIndex] = prev + current
 	a.tabs[a.activeTab].Content = append(a.tabs[a.activeTab].Content[:a.cursorY], a.tabs[a.activeTab].Content[a.cursorY+1:]...)
-	a.shiftLockedLines(a.cursorY, -1)
 	a.cursorY = prevIndex
 	a.cursorX = len([]rune(prev))
-	a.handoff = handoffHumanLed
 	a.statusMessage = "Merged the current line into the previous line."
 }
 
@@ -617,17 +674,11 @@ func (a *App) deleteEditor() {
 		a.replaceSelection("")
 		return
 	}
-	if a.currentLineLocked() {
-		a.handoff = handoffDenied
-		a.statusMessage = "Current line is locked and cannot be edited directly."
-		return
-	}
 
 	line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
 	if a.cursorX < len(line) {
 		line = append(line[:a.cursorX], line[a.cursorX+1:]...)
 		a.tabs[a.activeTab].Content[a.cursorY] = string(line)
-		a.handoff = handoffHumanLed
 		a.statusMessage = "Deleted character at cursor."
 		return
 	}
@@ -637,66 +688,47 @@ func (a *App) deleteEditor() {
 	}
 
 	nextIndex := a.cursorY + 1
-	locked := a.tabs[a.activeTab].Locked
-	if locked != nil && locked[nextIndex] {
-		a.handoff = handoffDenied
-		a.statusMessage = "Next line is locked and cannot be merged."
-		return
-	}
-
 	next := a.tabs[a.activeTab].Content[nextIndex]
 	a.tabs[a.activeTab].Content[a.cursorY] = a.tabs[a.activeTab].Content[a.cursorY] + next
 	a.tabs[a.activeTab].Content = append(a.tabs[a.activeTab].Content[:nextIndex], a.tabs[a.activeTab].Content[nextIndex+1:]...)
-	a.shiftLockedLines(nextIndex, -1)
-	a.handoff = handoffHumanLed
 	a.statusMessage = "Merged the next line into the current line."
 }
 
-func (a *App) shiftLockedLines(fromIndex, delta int) {
-	locked := a.tabs[a.activeTab].Locked
-	if locked == nil || delta == 0 {
-		return
-	}
-
-	updated := make(map[int]bool, len(locked))
-	for index, value := range locked {
-		if !value {
-			continue
-		}
-		if index >= fromIndex {
-			updated[index+delta] = value
-		} else {
-			updated[index] = value
-		}
-	}
-	a.tabs[a.activeTab].Locked = updated
-}
-
 func (a *App) handleControlKey(ev *tcell.EventKey) bool {
+	if a.agentRunning {
+		a.statusMessage = "Edit agent request is still running. Please wait."
+		return false
+	}
 	switch ev.Key() {
 	case tcell.KeyEsc:
+		if a.hasControlSelection() {
+			a.clearControlSelection()
+			a.statusMessage = "Control selection cleared."
+			return false
+		}
 		if a.preview.Pending {
-			if a.preview.Kind == CommandDenied {
-				a.handoff = handoffDenied
-			} else {
-				a.handoff = handoffHumanLed
-			}
 			a.preview = Preview{}
-			a.reviewItems = nil
-			a.reviewCount = 0
 			a.statusMessage = "Preview cleared. You can edit the command before submitting again."
 			return false
 		}
 		a.focus = focusEditor
 		a.voiceState = "off"
-		a.handoff = handoffHumanLed
 		a.statusMessage = "Returned to editor focus."
 		return false
 	case tcell.KeyCtrlG:
 		a.focus = focusEditor
 		a.voiceState = "off"
-		a.handoff = handoffHumanLed
 		a.statusMessage = "Returned to editor focus."
+		return false
+	case tcell.KeyCtrlA:
+		if len(a.controlInput) == 0 {
+			a.statusMessage = "Control hub is empty."
+			return false
+		}
+		a.controlSelectAnchor = 0
+		a.controlCursor = len(a.controlInput)
+		a.ensureControlCursorInBounds()
+		a.statusMessage = "Selected all control input."
 		return false
 	case tcell.KeyEnter:
 		input := strings.TrimSpace(string(a.controlInput))
@@ -706,69 +738,490 @@ func (a *App) handleControlKey(ev *tcell.EventKey) bool {
 		}
 
 		if !a.preview.Pending {
-			a.preview = BuildPreview(input, a.currentScope(), a.tabs[a.activeTab].Title, a.currentLineLocked())
-			a.reviewItems = a.buildReviewItems(a.preview)
-			a.reviewCount = len(a.reviewItems)
-			a.handoff = a.previewState(a.preview)
-			if a.preview.Kind == CommandDenied {
-				a.statusMessage = "Preview denied. Current scope is locked; narrow the target or inspect only."
-			} else {
-				a.statusMessage = "Preview ready. Press Enter again to confirm or Esc to edit."
+			a.preview = BuildPreview(input, a.currentScope(), a.tabs[a.activeTab].Title)
+			if !commandRequiresConfirmation(a.preview.Kind) {
+				if a.startControlExecution(input) {
+					return false
+				}
+				response, err := a.executePreview(input)
+				if err != nil {
+					a.agentRunning = false
+					a.stopSpinner()
+					a.voiceState = "ready"
+					a.statusMessage = err.Error()
+					return false
+				}
+				a.completeControlExecution(response)
+				return false
 			}
+			a.statusMessage = "Preview ready for the current scope. Press Enter again to confirm or Esc to edit."
 			a.voiceState = "captured"
 			return false
 		}
 
-		if a.preview.Kind == CommandDenied {
-			a.statusMessage = "Denied change kept in review. Locked scope remains unchanged."
-			a.focus = focusEditor
-			a.voiceState = "off"
-			a.preview = Preview{}
+		if a.startControlExecution(input) {
 			return false
 		}
-
-		a.lastApplied = a.preview.ProposalID
-		a.handoff = handoffApplying
-		a.statusMessage = "Applied to " + a.preview.Target + " in " + a.preview.Tab + ": " + a.preview.Action
-		a.reviewItems = nil
-		a.preview = Preview{}
-		a.controlInput = nil
-		a.controlCursor = 0
-		a.reviewCount = 0
-		a.focus = focusEditor
-		a.voiceState = "off"
-		a.handoff = handoffHumanLed
+		response, err := a.executePreview(input)
+		if err != nil {
+			a.agentRunning = false
+			a.stopSpinner()
+			a.voiceState = "ready"
+			a.statusMessage = err.Error()
+			return false
+		}
+		a.completeControlExecution(response)
+		return false
+	case tcell.KeyCtrlC:
+		a.copyControlInput()
+		return false
+	case tcell.KeyCtrlX:
+		a.cutControlInput()
+		return false
+	case tcell.KeyCtrlV:
+		a.pasteControlInput()
 		return false
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		if a.hasControlSelection() {
+			a.replaceControlSelection("")
+			return false
+		}
 		if a.controlCursor > 0 {
+			a.clearLastAgentReply()
 			a.controlInput = append(a.controlInput[:a.controlCursor-1], a.controlInput[a.controlCursor:]...)
 			a.controlCursor--
+			a.ensureControlCursorInBounds()
 			a.preview = Preview{}
 		}
 		return false
 	case tcell.KeyLeft:
+		if hasSelectionModifier(ev.Modifiers()) {
+			a.moveControlCursor(-1, true)
+			return false
+		}
 		if a.controlCursor > 0 {
 			a.controlCursor--
 		}
+		a.clearControlSelection()
+		a.ensureControlCursorInBounds()
 		return false
 	case tcell.KeyRight:
+		if hasSelectionModifier(ev.Modifiers()) {
+			a.moveControlCursor(1, true)
+			return false
+		}
 		if a.controlCursor < len(a.controlInput) {
 			a.controlCursor++
 		}
+		a.clearControlSelection()
+		a.ensureControlCursorInBounds()
+		return false
+	case tcell.KeyHome:
+		a.moveControlBoundary(true, hasSelectionModifier(ev.Modifiers()))
+		return false
+	case tcell.KeyEnd:
+		a.moveControlBoundary(false, hasSelectionModifier(ev.Modifiers()))
 		return false
 	case tcell.KeyRune:
 		r := ev.Rune()
+		if a.hasControlSelection() {
+			a.clearLastAgentReply()
+			a.replaceControlSelection(string(r))
+			return false
+		}
+		a.clearLastAgentReply()
 		a.controlInput = append(a.controlInput[:a.controlCursor], append([]rune{r}, a.controlInput[a.controlCursor:]...)...)
-		a.controlCursor++
+		a.controlInput, a.controlCursor = normalizeInsertedRunes(a.controlInput, a.controlCursor+1)
+		a.ensureControlCursorInBounds()
 		a.preview = Preview{}
-		a.reviewItems = nil
-		a.reviewCount = 0
 		a.voiceState = "listening"
-		a.handoff = handoffAgentSuggest
 		return false
 	}
 
 	return false
+}
+
+func (a *App) executePreview(input string) (agent.Response, error) {
+	if a.preview.Kind == CommandMemo {
+		return a.saveCurrentFileMemo(input)
+	}
+	if a.agentExecutor == nil {
+		return agent.Response{}, errors.New("edit agent is not configured or ready")
+	}
+
+	response, err := a.agentExecutor.Execute(context.Background(), agent.Request{
+		Command:   input,
+		Action:    a.preview.Action,
+		Kind:      string(a.preview.Kind),
+		Scope:     a.preview.Target,
+		Tab:       a.preview.Tab,
+		Selection: a.selectedTextOrEmpty(),
+		Document:  a.currentDocumentText(),
+		Workspace: a.workspaceRoot,
+	})
+	if err != nil {
+		return agent.Response{}, fmt.Errorf("edit agent failed: %w", err)
+	}
+
+	if err := a.applyAgentResponse(response); err != nil {
+		return agent.Response{}, err
+	}
+
+	return response, nil
+}
+
+func (a *App) beginControlExecution() {
+	a.agentRunning = true
+	a.spinnerIndex = 0
+	a.voiceState = "sending"
+	switch a.preview.Kind {
+	case CommandMemo:
+		a.statusMessage = "Saving memo for the current target..."
+	default:
+		a.statusMessage = "Sending request to the edit agent..."
+	}
+	if a.screen != nil {
+		a.draw()
+	}
+}
+
+func (a *App) startSpinner() {
+	if a.screen == nil {
+		return
+	}
+	if a.spinnerStop != nil {
+		close(a.spinnerStop)
+	}
+	stop := make(chan struct{})
+	a.spinnerStop = stop
+	go func() {
+		ticker := time.NewTicker(120 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				a.screen.PostEventWait(tcell.NewEventInterrupt(spinnerTick{}))
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
+func (a *App) stopSpinner() {
+	if a.spinnerStop != nil {
+		close(a.spinnerStop)
+		a.spinnerStop = nil
+	}
+	a.spinnerIndex = 0
+}
+
+func (a *App) executeAgentRequest(req agent.Request) (agent.Response, error) {
+	if a.agentExecutor == nil {
+		return agent.Response{}, errors.New("edit agent is not configured or ready")
+	}
+	response, err := a.agentExecutor.Execute(context.Background(), req)
+	if err != nil {
+		return agent.Response{}, fmt.Errorf("edit agent failed: %w", err)
+	}
+	return response, nil
+}
+
+func (a *App) startControlExecution(input string) bool {
+	if a.screen == nil || a.preview.Kind == CommandMemo {
+		a.beginControlExecution()
+		return false
+	}
+	request := agent.Request{
+		Command:   input,
+		Action:    a.preview.Action,
+		Kind:      string(a.preview.Kind),
+		Scope:     a.preview.Target,
+		Tab:       a.preview.Tab,
+		Selection: a.selectedTextOrEmpty(),
+		Document:  a.currentDocumentText(),
+		Workspace: a.workspaceRoot,
+	}
+	a.beginControlExecution()
+	a.startSpinner()
+	go func() {
+		response, err := a.executeAgentRequest(request)
+		if a.screen != nil {
+			a.screen.PostEventWait(tcell.NewEventInterrupt(controlExecutionResult{response: response, err: err}))
+		}
+	}()
+	return true
+}
+
+func (a *App) finishControlExecution(result controlExecutionResult) {
+	a.agentRunning = false
+	a.stopSpinner()
+	if result.err != nil {
+		a.statusMessage = result.err.Error()
+		a.voiceState = "ready"
+		return
+	}
+	if err := a.applyAgentResponse(result.response); err != nil {
+		a.statusMessage = err.Error()
+		a.voiceState = "ready"
+		return
+	}
+	a.completeControlExecution(result.response)
+}
+
+func (a *App) completeControlExecution(response agent.Response) {
+	a.agentRunning = false
+	a.stopSpinner()
+	a.lastCommand = a.preview.Summary()
+	a.lastAgentReply = response.Message
+	a.lastAgentResult = response.Message
+	a.statusMessage = response.Message
+	a.preview = Preview{}
+	a.controlInput = nil
+	a.controlCursor = 0
+	a.clearControlSelection()
+	a.ensureControlCursorInBounds()
+	a.focus = focusControl
+	a.voiceState = "ready"
+}
+
+func (a *App) saveCurrentFileMemo(input string) (agent.Response, error) {
+	current := a.tabs[a.activeTab]
+	if strings.TrimSpace(current.FilePath) == "" {
+		return agent.Response{}, errors.New("current tab is not backed by a real file")
+	}
+	note := extractMemoNote(input)
+	if strings.TrimSpace(note) == "" {
+		return agent.Response{}, errors.New("memo note is empty")
+	}
+	note = a.resolveMemoContent(input, note)
+	memoPath, err := memo.SaveFileMemo(a.systemMemoRoot, a.workspaceRoot, current.FilePath, note)
+	if err != nil {
+		return agent.Response{}, fmt.Errorf("failed to save memo: %w", err)
+	}
+	return agent.Response{Mode: agent.ModeMessage, Message: "Saved memo to " + filepath.ToSlash(memoPath)}, nil
+}
+
+func (a *App) resolveMemoContent(input, extracted string) string {
+	trimmed := strings.TrimSpace(input)
+	if (strings.HasPrefix(trimmed, "memo ") || strings.HasPrefix(trimmed, "메모 ")) && strings.TrimSpace(extracted) != "" {
+		return extracted
+	}
+	if strings.TrimSpace(a.lastAgentResult) != "" {
+		return a.lastAgentResult
+	}
+	return extracted
+}
+
+func extractMemoNote(input string) string {
+	payload, ok := memoCommandPayload(input)
+	if ok {
+		return payload
+	}
+	return ""
+}
+
+func (a *App) applyAgentResponse(response agent.Response) error {
+	switch response.Mode {
+	case agent.ModeMessage:
+		return nil
+	case agent.ModeReplaceSelection:
+		if !a.hasSelection() {
+			return errors.New("edit agent requested selection replacement, but no selection is active")
+		}
+		a.replaceSelection(response.Content)
+		return nil
+	case agent.ModeReplaceDocument:
+		a.replaceDocument(response.Content)
+		return nil
+	default:
+		return fmt.Errorf("edit agent returned unsupported mode: %s", response.Mode)
+	}
+}
+
+func (a *App) selectedTextOrEmpty() string {
+	if !a.hasSelection() {
+		return ""
+	}
+	return a.selectedText()
+}
+
+func (a *App) currentDocumentText() string {
+	return strings.Join(a.tabs[a.activeTab].Content, "\n")
+}
+
+func (a *App) replaceDocument(content string) {
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	a.tabs[a.activeTab].Content = lines
+	a.cursorY = 0
+	a.cursorX = 0
+	a.selectionAnchor = -1
+	a.selectionAnchorCol = 0
+	a.ensureCursorInBounds()
+}
+
+func (a *App) copyControlInput() {
+	text := string(a.controlInput)
+	if a.hasControlSelection() {
+		text = a.selectedControlText()
+	}
+	if text == "" {
+		a.statusMessage = "Control hub is empty."
+		return
+	}
+	a.clipboard = text
+	if err := clipboardWrite(a.clipboard); err != nil {
+		a.statusMessage = "Copied control input to internal clipboard; system clipboard unavailable."
+		return
+	}
+	a.statusMessage = "Copied control input to system clipboard."
+}
+
+func (a *App) cutControlInput() {
+	text := string(a.controlInput)
+	if a.hasControlSelection() {
+		text = a.selectedControlText()
+	}
+	if text == "" {
+		a.statusMessage = "Control hub is empty."
+		return
+	}
+	a.clipboard = text
+	if err := clipboardWrite(a.clipboard); err != nil {
+		a.statusMessage = "Cut control input to internal clipboard; system clipboard unavailable."
+	} else {
+		a.statusMessage = "Cut control input to system clipboard."
+	}
+	if a.hasControlSelection() {
+		a.replaceControlSelection("")
+	} else {
+		a.controlInput = nil
+		a.controlCursor = 0
+		a.clearControlSelection()
+		a.ensureControlCursorInBounds()
+		a.preview = Preview{}
+	}
+}
+
+func (a *App) pasteControlInput() {
+	a.clearLastAgentReply()
+	text := a.clipboard
+	if external, err := clipboardRead(); err == nil && external != "" {
+		text = external
+		a.clipboard = external
+	}
+	if text == "" {
+		a.statusMessage = "Clipboard is empty."
+		return
+	}
+	if a.hasControlSelection() {
+		a.replaceControlSelection(text)
+		a.statusMessage = "Pasted clipboard into control hub."
+		return
+	}
+	for _, r := range []rune(text) {
+		a.controlInput = append(a.controlInput[:a.controlCursor], append([]rune{r}, a.controlInput[a.controlCursor:]...)...)
+		a.controlCursor++
+	}
+	a.ensureControlCursorInBounds()
+	a.preview = Preview{}
+	a.voiceState = "listening"
+	a.statusMessage = "Pasted clipboard into control hub."
+}
+
+func (a *App) hasControlSelection() bool {
+	if a.controlSelectAnchor < 0 {
+		return false
+	}
+	return a.controlSelectAnchor != a.controlCursor
+}
+
+func (a *App) clearControlSelection() {
+	a.controlSelectAnchor = -1
+}
+
+func (a *App) controlSelectionRange() (int, int, bool) {
+	if !a.hasControlSelection() {
+		return 0, 0, false
+	}
+	start := a.controlSelectAnchor
+	end := a.controlCursor
+	if start > end {
+		start, end = end, start
+	}
+	return start, end, true
+}
+
+func (a *App) moveControlCursor(delta int, selecting bool) {
+	if selecting {
+		if a.controlSelectAnchor < 0 {
+			a.controlSelectAnchor = a.controlCursor
+		}
+	} else {
+		a.clearControlSelection()
+	}
+	a.controlCursor += delta
+	a.ensureControlCursorInBounds()
+}
+
+func (a *App) moveControlBoundary(toStart bool, selecting bool) {
+	if selecting {
+		if a.controlSelectAnchor < 0 {
+			a.controlSelectAnchor = a.controlCursor
+		}
+	} else {
+		a.clearControlSelection()
+	}
+	if toStart {
+		a.controlCursor = 0
+		a.ensureControlCursorInBounds()
+		return
+	}
+	a.controlCursor = len(a.controlInput)
+	a.ensureControlCursorInBounds()
+}
+
+func (a *App) ensureControlCursorInBounds() {
+	if a.controlCursor < 0 {
+		a.controlCursor = 0
+	}
+	if a.controlCursor > len(a.controlInput) {
+		a.controlCursor = len(a.controlInput)
+	}
+	if a.controlSelectAnchor > len(a.controlInput) {
+		a.controlSelectAnchor = len(a.controlInput)
+	}
+	a.syncControlViewport()
+}
+
+func (a *App) selectedControlText() string {
+	start, end, ok := a.controlSelectionRange()
+	if !ok {
+		return ""
+	}
+	return string(a.controlInput[start:end])
+}
+
+func (a *App) replaceControlSelection(text string) {
+	a.clearLastAgentReply()
+	start, end, ok := a.controlSelectionRange()
+	if !ok {
+		return
+	}
+	replacement := []rune(text)
+	a.controlInput = append(append([]rune(nil), a.controlInput[:start]...), append(replacement, a.controlInput[end:]...)...)
+	a.controlCursor = start + len(replacement)
+	a.clearControlSelection()
+	a.ensureControlCursorInBounds()
+	a.preview = Preview{}
+	a.voiceState = "listening"
+}
+
+func (a *App) clearLastAgentReply() {
+	a.lastAgentReply = ""
 }
 
 func (a *App) nextTab() {
@@ -793,6 +1246,8 @@ func (a *App) saveCurrentTabState() {
 		return
 	}
 	tab := &a.tabs[a.activeTab]
+	tab.ViewTop = a.viewportTop
+	tab.ViewLeft = a.viewportLeft
 	tab.CursorX = a.cursorX
 	tab.CursorY = a.cursorY
 	tab.SelectionAnchorX = a.selectionAnchorX()
@@ -804,12 +1259,17 @@ func (a *App) loadCurrentTabState() {
 		return
 	}
 	tab := &a.tabs[a.activeTab]
+	a.viewportTop = tab.ViewTop
+	a.viewportLeft = tab.ViewLeft
 	a.cursorX = tab.CursorX
 	a.cursorY = tab.CursorY
 	a.setSelectionAnchor(tab.SelectionAnchorX, tab.SelectionAnchorY)
 	a.ensureCursorInBounds()
+	a.syncViewport()
 	tab.CursorX = a.cursorX
 	tab.CursorY = a.cursorY
+	tab.ViewTop = a.viewportTop
+	tab.ViewLeft = a.viewportLeft
 	tab.SelectionAnchorX = a.selectionAnchorX()
 	tab.SelectionAnchorY = a.selectionAnchor
 }
@@ -1068,7 +1528,11 @@ func (a *App) copySelection() {
 		return
 	}
 	a.clipboard = a.selectedText()
-	a.statusMessage = "Copied selection."
+	if err := clipboardWrite(a.clipboard); err != nil {
+		a.statusMessage = "Copied selection to internal clipboard; system clipboard unavailable."
+		return
+	}
+	a.statusMessage = "Copied selection to system clipboard."
 }
 
 func (a *App) cutSelection() {
@@ -1077,23 +1541,45 @@ func (a *App) cutSelection() {
 		return
 	}
 	a.clipboard = a.selectedText()
+	if err := clipboardWrite(a.clipboard); err != nil {
+		a.statusMessage = "Cut selection to internal clipboard; system clipboard unavailable."
+		a.replaceSelection("")
+		return
+	}
 	a.replaceSelection("")
-	a.statusMessage = "Cut selection."
+	a.statusMessage = "Cut selection to system clipboard."
 }
 
 func (a *App) pasteClipboard() {
-	if a.clipboard == "" {
+	clipboardText := a.clipboard
+	if external, err := clipboardRead(); err == nil && external != "" {
+		clipboardText = external
+		a.clipboard = external
+	}
+	if clipboardText == "" {
 		a.statusMessage = "Clipboard is empty."
 		return
 	}
-	a.insertString(a.clipboard)
+	a.insertString(clipboardText)
 	a.statusMessage = "Pasted clipboard at caret."
+}
+
+func (a *App) selectAllEditor() {
+	if len(a.tabs[a.activeTab].Content) == 0 {
+		a.statusMessage = "Nothing to select."
+		return
+	}
+	lastLine := len(a.tabs[a.activeTab].Content) - 1
+	lastCol := len([]rune(a.tabs[a.activeTab].Content[lastLine]))
+	a.setSelectionAnchor(0, 0)
+	a.cursorY = lastLine
+	a.cursorX = lastCol
+	a.statusMessage = "Selected entire document."
 }
 
 func (a *App) clearSelection(message string) {
 	a.selectionAnchor = -1
 	a.selectionAnchorCol = 0
-	a.handoff = handoffHumanLed
 	a.statusMessage = message
 }
 
@@ -1103,7 +1589,6 @@ func (a *App) expandSelection(delta int) {
 	}
 	a.cursorY += delta
 	a.ensureCursorInBounds()
-	a.handoff = handoffHumanLed
 	start, end, _ := a.selectionRange()
 	if compareTextPos(start, end) == 0 {
 		a.statusMessage = fmt.Sprintf("Selection anchored on line %d.", start.y+1)
@@ -1132,80 +1617,25 @@ func (a *App) moveSelectedBlock(delta int) {
 		return
 	}
 
-	flags := a.lockedFlags()
-	if a.rangeLocked(start, end, flags) {
-		a.handoff = handoffDenied
-		a.statusMessage = "Locked lines cannot be moved as a selection block."
-		return
-	}
-
-	adjacent := start - 1
-	if delta > 0 {
-		adjacent = end + 1
-	}
-	if adjacent >= 0 && adjacent < len(flags) && flags[adjacent] {
-		a.handoff = handoffDenied
-		a.statusMessage = "Cannot swap selection across a locked line."
-		return
-	}
-
 	if delta < 0 {
 		aboveLine := content[start-1]
 		selected := append([]string(nil), content[start:end+1]...)
 		copy(content[start-1:], append(selected, aboveLine))
-
-		aboveLocked := flags[start-1]
-		selectedLocked := append([]bool(nil), flags[start:end+1]...)
-		copy(flags[start-1:], append(selectedLocked, aboveLocked))
 		start--
 		end--
 	} else {
 		belowLine := content[end+1]
 		selected := append([]string(nil), content[start:end+1]...)
 		copy(content[start:], append([]string{belowLine}, selected...))
-
-		belowLocked := flags[end+1]
-		selectedLocked := append([]bool(nil), flags[start:end+1]...)
-		copy(flags[start:], append([]bool{belowLocked}, selectedLocked...))
 		start++
 		end++
 	}
 
 	a.tabs[a.activeTab].Content = content
-	a.applyLockedFlags(flags)
 	a.setSelectionAnchor(a.selectionAnchorX(), start)
 	a.cursorY = end
 	a.ensureCursorInBounds()
-	a.handoff = handoffHumanLed
 	a.statusMessage = fmt.Sprintf("Moved selected block to lines %d-%d.", start+1, end+1)
-}
-
-func (a *App) lockedFlags() []bool {
-	content := a.tabs[a.activeTab].Content
-	flags := make([]bool, len(content))
-	for index := range content {
-		flags[index] = a.tabs[a.activeTab].Locked[index]
-	}
-	return flags
-}
-
-func (a *App) applyLockedFlags(flags []bool) {
-	updated := make(map[int]bool)
-	for index, locked := range flags {
-		if locked {
-			updated[index] = true
-		}
-	}
-	a.tabs[a.activeTab].Locked = updated
-}
-
-func (a *App) rangeLocked(start, end int, flags []bool) bool {
-	for index := start; index <= end; index++ {
-		if flags[index] {
-			return true
-		}
-	}
-	return false
 }
 
 func (a *App) activeLineRange() (int, int) {
@@ -1217,12 +1647,6 @@ func (a *App) activeLineRange() (int, int) {
 
 func (a *App) indentSelection() {
 	start, end := a.activeLineRange()
-	flags := a.lockedFlags()
-	if a.rangeLocked(start, end, flags) {
-		a.handoff = handoffDenied
-		a.statusMessage = "Locked lines cannot be indented."
-		return
-	}
 
 	for index := start; index <= end; index++ {
 		a.tabs[a.activeTab].Content[index] = a.indentUnit() + a.tabs[a.activeTab].Content[index]
@@ -1233,7 +1657,6 @@ func (a *App) indentSelection() {
 	} else {
 		a.cursorX += len([]rune(a.indentUnit()))
 	}
-	a.handoff = handoffHumanLed
 	if start == end {
 		a.statusMessage = fmt.Sprintf("Indented line %d.", start+1)
 	} else {
@@ -1243,12 +1666,6 @@ func (a *App) indentSelection() {
 
 func (a *App) outdentSelection() {
 	start, end := a.activeLineRange()
-	flags := a.lockedFlags()
-	if a.rangeLocked(start, end, flags) {
-		a.handoff = handoffDenied
-		a.statusMessage = "Locked lines cannot be outdented."
-		return
-	}
 
 	removedOnCursor := 0
 	for index := start; index <= end; index++ {
@@ -1264,7 +1681,6 @@ func (a *App) outdentSelection() {
 			a.cursorX = 0
 		}
 	}
-	a.handoff = handoffHumanLed
 	if start == end {
 		a.statusMessage = fmt.Sprintf("Outdented line %d.", start+1)
 	} else {
@@ -1294,7 +1710,6 @@ func (a *App) selectCodeBlock() {
 	if len(candidates) == 0 {
 		a.setSelectionAnchor(0, a.cursorY)
 		a.cursorX = len([]rune(a.tabs[a.activeTab].Content[a.cursorY]))
-		a.handoff = handoffHumanLed
 		a.statusMessage = fmt.Sprintf("No enclosing block found; selected line %d.", a.cursorY+1)
 		return
 	}
@@ -1304,7 +1719,6 @@ func (a *App) selectCodeBlock() {
 		if !ok {
 			a.setSelectionAnchor(0, a.cursorY)
 			a.cursorX = len([]rune(a.tabs[a.activeTab].Content[a.cursorY]))
-			a.handoff = handoffHumanLed
 			a.statusMessage = fmt.Sprintf("No enclosing block found; selected line %d.", a.cursorY+1)
 			return
 		}
@@ -1312,7 +1726,6 @@ func (a *App) selectCodeBlock() {
 		a.cursorY = candidate.end
 		a.cursorX = len([]rune(a.tabs[a.activeTab].Content[a.cursorY]))
 		a.ensureCursorInBounds()
-		a.handoff = handoffHumanLed
 		a.statusMessage = fmt.Sprintf("Selected code block lines %d-%d.", candidate.start+1, candidate.end+1)
 		return
 	}
@@ -1322,12 +1735,10 @@ func (a *App) selectCodeBlock() {
 		a.cursorY = candidate.end
 		a.cursorX = len([]rune(a.tabs[a.activeTab].Content[a.cursorY]))
 		a.ensureCursorInBounds()
-		a.handoff = handoffHumanLed
 		a.statusMessage = fmt.Sprintf("Expanded to parent block lines %d-%d.", candidate.start+1, candidate.end+1)
 		return
 	}
 
-	a.handoff = handoffHumanLed
 	a.statusMessage = "No larger parent block found for the current selection."
 }
 
@@ -1565,45 +1976,6 @@ func looksLikeBlockHeader(trimmed string) bool {
 	return strings.HasSuffix(trimmed, "{") || strings.HasSuffix(trimmed, ":")
 }
 
-func (a *App) currentLineLocked() bool {
-	locked := a.tabs[a.activeTab].Locked
-	return locked != nil && locked[a.cursorY]
-}
-
-func (a *App) buildReviewItems(preview Preview) []reviewItem {
-	if !preview.Pending {
-		return nil
-	}
-
-	state := a.previewState(preview)
-	if preview.ProposalID == "" {
-		return []reviewItem{{
-			ID:     preview.ReviewLabel,
-			Action: preview.Action,
-			Target: preview.Target,
-			State:  state,
-		}}
-	}
-
-	return []reviewItem{{
-		ID:     preview.ProposalID,
-		Action: preview.Action,
-		Target: preview.Target,
-		State:  state,
-	}}
-}
-
-func (a *App) previewState(preview Preview) handoffState {
-	switch preview.Kind {
-	case CommandDenied:
-		return handoffDenied
-	case CommandApprove:
-		return handoffApplying
-	default:
-		return handoffReviewPending
-	}
-}
-
 func (a *App) ensureCursorInBounds() {
 	content := a.tabs[a.activeTab].Content
 	if len(content) == 0 {
@@ -1623,6 +1995,103 @@ func (a *App) ensureCursorInBounds() {
 	}
 	if a.cursorX > lineWidth {
 		a.cursorX = lineWidth
+	}
+	a.syncViewport()
+}
+
+func (a *App) syncViewport() {
+	content := a.tabs[a.activeTab].Content
+	if len(content) == 0 {
+		a.viewportTop = 0
+		a.viewportLeft = 0
+		return
+	}
+	visibleHeight := a.editorViewportHeight
+	if visibleHeight <= 0 {
+		visibleHeight = 10
+	}
+	maxTop := len(content) - visibleHeight
+	if maxTop < 0 {
+		maxTop = 0
+	}
+	if a.viewportTop < 0 {
+		a.viewportTop = 0
+	}
+	if a.viewportTop > maxTop {
+		a.viewportTop = maxTop
+	}
+	if a.cursorY < a.viewportTop {
+		a.viewportTop = a.cursorY
+	}
+	if a.cursorY >= a.viewportTop+visibleHeight {
+		a.viewportTop = a.cursorY - visibleHeight + 1
+	}
+	if a.viewportTop < 0 {
+		a.viewportTop = 0
+	}
+	if a.viewportTop > maxTop {
+		a.viewportTop = maxTop
+	}
+
+	visibleWidth := a.editorViewportWidth
+	if visibleWidth <= 0 {
+		visibleWidth = 20
+	}
+	line := []rune(content[a.cursorY])
+	lineWidth := visualColumnForRunes(line, len(line))
+	maxLeft := lineWidth - visibleWidth
+	if maxLeft < 0 {
+		maxLeft = 0
+	}
+	if a.viewportLeft < 0 {
+		a.viewportLeft = 0
+	}
+	if a.viewportLeft > maxLeft {
+		a.viewportLeft = maxLeft
+	}
+	cursorVisualX := visualColumnForRunes(line, a.cursorX)
+	if cursorVisualX < a.viewportLeft {
+		a.viewportLeft = cursorVisualX
+	}
+	if cursorVisualX >= a.viewportLeft+visibleWidth {
+		a.viewportLeft = cursorVisualX - visibleWidth + 1
+	}
+	if a.viewportLeft < 0 {
+		a.viewportLeft = 0
+	}
+	if a.viewportLeft > maxLeft {
+		a.viewportLeft = maxLeft
+	}
+}
+
+func (a *App) syncControlViewport() {
+	visibleWidth := a.controlViewportWidth
+	if visibleWidth <= 0 {
+		visibleWidth = 20
+	}
+	lineWidth := visualColumnForRunes(a.controlInput, len(a.controlInput))
+	maxLeft := lineWidth - visibleWidth
+	if maxLeft < 0 {
+		maxLeft = 0
+	}
+	if a.controlViewportLeft < 0 {
+		a.controlViewportLeft = 0
+	}
+	if a.controlViewportLeft > maxLeft {
+		a.controlViewportLeft = maxLeft
+	}
+	cursorVisualX := visualColumnForRunes(a.controlInput, a.controlCursor)
+	if cursorVisualX < a.controlViewportLeft {
+		a.controlViewportLeft = cursorVisualX
+	}
+	if cursorVisualX >= a.controlViewportLeft+visibleWidth {
+		a.controlViewportLeft = cursorVisualX - visibleWidth + 1
+	}
+	if a.controlViewportLeft < 0 {
+		a.controlViewportLeft = 0
+	}
+	if a.controlViewportLeft > maxLeft {
+		a.controlViewportLeft = maxLeft
 	}
 }
 
@@ -1677,12 +2146,23 @@ func (a *App) drawTabs(width int) {
 func (a *App) drawEditSurface(x, y, width, height int) {
 	a.drawBox(x, y, width, height, styleBox(), "Active Edit Surface")
 	content := a.tabs[a.activeTab].Content
-	for i := 0; i < len(content) && i < height-2; i++ {
+	visibleHeight := height - 2
+	if visibleHeight < 1 {
+		visibleHeight = 1
+	}
+	visibleWidth := width - 5
+	if visibleWidth < 1 {
+		visibleWidth = 1
+	}
+	a.editorViewportHeight = visibleHeight
+	a.editorViewportWidth = visibleWidth
+	a.syncViewport()
+	for i := 0; i < visibleHeight && i+a.viewportTop < len(content); i++ {
+		lineIndex := i + a.viewportTop
 		lineY := y + 1 + i
-		line := trimRunes(content[i], width-5)
-		gutter, style := a.lineVisual(i)
+		gutter, style := a.lineVisual(lineIndex)
 		a.drawText(x+1, lineY, styleGutter(), gutter)
-		a.drawTextWithVisibleTabs(x+4, lineY, i, style, line)
+		a.drawTextWithVisibleTabs(x+4, lineY, lineIndex, style, []rune(content[lineIndex]), a.viewportLeft, visibleWidth)
 	}
 	footer := fmt.Sprintf("Focus:%s  Scope:%s  Indent:[Tab/Shift+Tab]  Width:[Alt+0..4]  Tabs:[Alt+,/Alt+. or Ctrl+Tab/Ctrl+Shift+Tab]  Block:[F2/Ctrl+Space/Ctrl+[]  Ctrl+Up/Down:[line or block]  Control:[Ctrl+G]  Quit:[Ctrl+Q]", a.focusLabel(), a.currentScope())
 	if a.helpVisible {
@@ -1690,8 +2170,8 @@ func (a *App) drawEditSurface(x, y, width, height int) {
 	}
 	a.drawText(x+1, y+height-1, styleMuted(), trimRunes(footer, width-2))
 	if a.focus == focusEditor && !a.helpVisible && !a.quitConfirm {
-		cursorX := x + 4 + a.cursorX
-		cursorY := y + 1 + a.cursorY
+		cursorX := x + 4 + (visualColumnForRunes([]rune(content[a.cursorY]), a.cursorX) - a.viewportLeft)
+		cursorY := y + 1 + (a.cursorY - a.viewportTop)
 		maxX := x + width - 2
 		maxY := y + height - 2
 		if cursorX > maxX {
@@ -1710,16 +2190,30 @@ func (a *App) drawControlPanel(x, y, width, height int) {
 		title += " (focused)"
 	}
 	a.drawBox(x, y, width, height, styleBox(), title)
-	input := string(a.controlInput)
-	a.drawText(x+1, y+1, styleNormal(), trimRunes("> "+input, width-2))
+	visibleWidth := width - 4
+	if visibleWidth < 1 {
+		visibleWidth = 1
+	}
+	a.controlViewportWidth = visibleWidth
+	a.syncControlViewport()
+	a.drawControlInput(x+1, y+1, width-2)
 	preview := "Preview: type a command and press Enter"
 	if a.preview.Pending {
 		preview = "Preview: " + a.preview.Summary()
 	}
 	a.drawText(x+1, y+2, stylePreview(), trimRunes(preview, width-2))
-	a.drawText(x+1, y+3, styleMuted(), trimRunes("Examples: inspect recent change | simplify this block | show diff only", width-2))
+	footer := "Examples: inspect recent change | simplify this block | show diff only"
+	style := styleMuted()
+	if a.agentRunning {
+		footer = fmt.Sprintf("Sending %s", spinnerFrames[a.spinnerIndex])
+		style = stylePreview()
+	} else if strings.TrimSpace(a.lastAgentReply) != "" {
+		footer = "Reply: " + a.lastAgentReply
+		style = stylePreview()
+	}
+	a.drawText(x+1, y+3, style, trimRunes(footer, width-2))
 	if a.focus == focusControl {
-		cursorX := x + 3 + a.controlCursor
+		cursorX := x + 3 + (visualColumnForRunes(a.controlInput, a.controlCursor) - a.controlViewportLeft)
 		maxX := x + width - 2
 		if cursorX > maxX {
 			cursorX = maxX
@@ -1730,6 +2224,41 @@ func (a *App) drawControlPanel(x, y, width, height int) {
 	}
 }
 
+func (a *App) drawControlInput(x, y, width int) {
+	prefix := []rune("> ")
+	dx := x
+	for _, r := range prefix {
+		a.screen.SetContent(dx, y, r, nil, styleNormal())
+		dx += runeCellWidth(r)
+	}
+	maxWidth := width - visualColumnForRunes(prefix, len(prefix))
+	if maxWidth < 1 {
+		maxWidth = 1
+	}
+	currentCol := 0
+	for i, r := range a.controlInput {
+		style := styleNormal()
+		if start, end, ok := a.controlSelectionRange(); ok && i >= start && i < end {
+			style = styleSelection()
+		}
+		cellWidth := runeCellWidth(r)
+		nextCol := currentCol + cellWidth
+		if nextCol <= a.controlViewportLeft {
+			currentCol = nextCol
+			continue
+		}
+		if currentCol >= a.controlViewportLeft+maxWidth {
+			break
+		}
+		a.screen.SetContent(dx, y, r, nil, style)
+		dx += cellWidth
+		currentCol = nextCol
+		if dx >= x+width {
+			break
+		}
+	}
+}
+
 func (a *App) drawStatusSurface(x, y, width, height int) {
 	a.drawBox(x, y, width, height, styleBox(), "Status Surface")
 	lines := []string{
@@ -1737,21 +2266,19 @@ func (a *App) drawStatusSurface(x, y, width, height int) {
 		"scope: " + a.currentScope(),
 		"indent: " + a.indentModeLabel(),
 		"agent: " + a.agentState(),
-		"handoff: " + string(a.handoff),
-		fmt.Sprintf("review: %d pending", a.reviewCount),
+		"model: " + a.agentProfileLabel(),
 		"voice: " + a.voiceState,
-		"proposal: " + a.previewIDOrLastApplied(),
+		"command: " + a.previewOrLastCommand(),
 	}
 	for i := 0; i < len(lines) && i < height-2; i++ {
 		a.drawText(x+1, y+1+i, styleMuted(), trimRunes(lines[i], width-2))
 	}
 	if height >= 4 {
-		reviewLine := "queue: none"
-		if len(a.reviewItems) > 0 {
-			item := a.reviewItems[0]
-			reviewLine = fmt.Sprintf("queue: %s %s", item.ID, item.Target)
+		scopeLine := "selection: none"
+		if a.hasSelection() {
+			scopeLine = "selection: active"
 		}
-		a.drawText(x+1, y+height-2, stylePreview(), trimRunes(reviewLine, width-2))
+		a.drawText(x+1, y+height-2, stylePreview(), trimRunes(scopeLine, width-2))
 	}
 }
 
@@ -1786,20 +2313,21 @@ func (a *App) drawHelpDialog(screenWidth, screenHeight int) {
 		"  Shift/Alt+Home   select to line start",
 		"  Shift/Alt+End    select to line end",
 		"  Shift/Alt+Page   select by larger vertical steps",
-		"  Ctrl+C / Ctrl+X  copy or cut selection",
-		"  Ctrl+V           paste clipboard at caret",
+		"  Ctrl+A           select the full editor document",
+		"  Ctrl+C / Ctrl+X  copy or cut to system clipboard with internal fallback",
+		"  Ctrl+V           paste from system clipboard or internal fallback",
 		"  Ctrl+Up/Down     swap selected block with adjacent line",
 		"  Ctrl+Q           open quit confirmation",
 		"",
 		"Control hub",
-		"  Type a short command, then press Enter for preview.",
-		"  Press Enter again to confirm apply.",
+		"  Talk and inspect run on Enter.",
+		"  Edit and memo commands preview first, then confirm on Enter.",
+		"  Ctrl+A           select all control input",
+		"  Shift/Alt+Arrow  expand or shrink control selection",
+		"  Ctrl+C / Ctrl+X  copy or cut control input",
+		"  Ctrl+V           paste or replace control selection",
 		"  Example: simplify this block",
 		"  Example: inspect recent change",
-		"",
-		"Cowork states",
-		"  L! locked region   P> proposal   R? review-needed",
-		"  caret-range text selection   A+ approved   X! denied",
 	}
 
 	maxLen := 0
@@ -1883,52 +2411,34 @@ func (a *App) drawQuitDialog(screenWidth, screenHeight int) {
 
 func (a *App) agentState() string {
 	if a.preview.Pending {
-		return "review"
-	}
-	if a.handoff == handoffDenied {
-		return "denied"
+		return "preview"
 	}
 	if a.focus == focusControl {
-		return "suggesting"
+		return "scoping"
 	}
 	return "idle"
 }
 
-func (a *App) previewIDOrLastApplied() string {
-	if a.preview.ProposalID != "" {
-		return a.preview.ProposalID
+func (a *App) agentProfileLabel() string {
+	if strings.TrimSpace(a.agentProfile) == "" {
+		return "unconfigured"
 	}
-	if a.lastApplied != "" {
-		return a.lastApplied
+	return a.agentProfile
+}
+
+func (a *App) previewOrLastCommand() string {
+	if a.preview.Pending {
+		return a.preview.Summary()
 	}
-	if a.preview.Kind == CommandDenied {
-		return "locked-scope"
+	if a.lastCommand != "" {
+		return a.lastCommand
 	}
 	return "none"
 }
 
 func (a *App) lineVisual(index int) (string, tcell.Style) {
-	locked := a.tabs[a.activeTab].Locked[index]
-	if locked {
-		return "L! ", styleLocked()
-	}
-	if a.preview.Pending && index == a.cursorY {
-		switch a.preview.Kind {
-		case CommandDenied:
-			return "X! ", styleDenied()
-		case CommandPropose:
-			return "P> ", styleProposal()
-		case CommandReview, CommandInspect:
-			return "R? ", styleReviewNeeded()
-		case CommandApprove:
-			return "A+ ", styleApproved()
-		}
-	}
 	if index == a.cursorY {
 		return ">  ", styleCursorLine()
-	}
-	if a.lastApplied != "" && index == a.cursorY {
-		return "A+ ", styleApproved()
 	}
 	return "   ", styleNormal()
 }
@@ -1962,13 +2472,20 @@ func (a *App) drawBox(x, y, width, height int, style tcell.Style, title string) 
 }
 
 func (a *App) drawText(x, y int, style tcell.Style, text string) {
-	for i, r := range []rune(text) {
-		a.screen.SetContent(x+i, y, r, nil, style)
+	dx := x
+	for _, r := range []rune(text) {
+		a.screen.SetContent(dx, y, r, nil, style)
+		dx += runeCellWidth(r)
 	}
 }
 
-func (a *App) drawTextWithVisibleTabs(x, y, lineIndex int, style tcell.Style, text string) {
-	for i, r := range []rune(text) {
+func (a *App) drawTextWithVisibleTabs(x, y, lineIndex int, style tcell.Style, runes []rune, startCol, maxWidth int) {
+	if maxWidth <= 0 {
+		return
+	}
+	dx := x
+	currentCol := 0
+	for i, r := range runes {
 		cellRune := r
 		cellStyle := style
 		if a.selectionContains(textPos{x: i, y: lineIndex}) {
@@ -1981,8 +2498,62 @@ func (a *App) drawTextWithVisibleTabs(x, y, lineIndex int, style tcell.Style, te
 				cellStyle = styleSelection()
 			}
 		}
-		a.screen.SetContent(x+i, y, cellRune, nil, cellStyle)
+		cellWidth := runeCellWidth(cellRune)
+		nextCol := currentCol + cellWidth
+		if nextCol <= startCol {
+			currentCol = nextCol
+			continue
+		}
+		if currentCol >= startCol+maxWidth {
+			break
+		}
+		a.screen.SetContent(dx, y, cellRune, nil, cellStyle)
+		dx += cellWidth
+		currentCol = nextCol
+		if dx >= x+maxWidth {
+			break
+		}
 	}
+}
+
+func normalizeInsertedRunes(runes []rune, cursor int) ([]rune, int) {
+	normalized := []rune(norm.NFC.String(string(runes)))
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(normalized) {
+		cursor = len(normalized)
+	}
+	return normalized, cursor
+}
+
+func visualColumnForRunes(runes []rune, runeIndex int) int {
+	if runeIndex < 0 {
+		return 0
+	}
+	if runeIndex > len(runes) {
+		runeIndex = len(runes)
+	}
+	width := 0
+	for _, r := range runes[:runeIndex] {
+		width += runeCellWidth(displayRune(r))
+	}
+	return width
+}
+
+func displayRune(r rune) rune {
+	if r == '\t' {
+		return []rune(tabGlyph)[0]
+	}
+	return r
+}
+
+func runeCellWidth(r rune) int {
+	width := uniseg.StringWidth(string(r))
+	if width <= 0 {
+		return 1
+	}
+	return width
 }
 
 func trimRunes(input string, max int) string {

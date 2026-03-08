@@ -40,7 +40,8 @@ Terminal key delivery is not uniform. `gdedit` treats some shortcuts as best-eff
 | `F1` | High | Help dialog |
 | `F2` | High | Hierarchical block selection |
 | `Ctrl+Q` | High | Quit confirmation |
-| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Medium | Internal copy, cut, and paste |
+| `Ctrl+A` | Medium | Select all in the editor or Control Hub |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Medium | Copy, cut, and paste with system clipboard fallback |
 | `Alt+.` / `Alt+,` | Medium to high | Primary tab navigation |
 | `Shift`, `Alt`, `Shift+Alt` with arrows | Medium | Selection expansion modifiers; any one may be missing depending on terminal |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Low | Best-effort tab navigation alias |
@@ -66,6 +67,8 @@ This keeps storage and display separate, avoids cursor-width ambiguity, and make
 - `Shift`, `Alt`, and `Shift+Alt` are all accepted as selection modifiers for movement keys.
 - The visible selection is the true text range between the anchor caret and the active caret.
 - Structural edits still work on covered lines by projecting the text selection to its start and end lines.
+- The Control Hub follows the same modifier tolerance for one-line selection and supports selection-aware copy, cut, paste, and replace.
+- Clipboard reads and writes prefer the system clipboard when available and fall back to gdedit's internal clipboard when they are not.
 - Terminal mouse drag remains an external terminal selection, not an internal gdedit edit selection.
 
 ## Supported Terminals
@@ -141,7 +144,8 @@ This matrix lists basic checks you can perform to verify terminal compatibility.
 | Enter/Backspace | Newlines and deletions work as expected |
 | Resize terminal to 80x24 | UI adapts without breaking |
 | Resize below 80x24 | Editor shows warning or error |
-| Mouse click in editor | Cursor moves to clicked position (if mouse supported) |
+| `Ctrl+A` in editor | Entire document becomes selected |
+| `Ctrl+A` in Control Hub | Entire command input becomes selected |
 | Copy text | Selected text copies to clipboard (if supported) |
 | Paste text | Pasted text appears in buffer |
 | Quit editor | Returns cleanly to shell, original screen content restored |

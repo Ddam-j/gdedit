@@ -9,113 +9,96 @@ type CommandKind string
 
 const (
 	CommandInspect CommandKind = "inspect"
-	CommandPropose CommandKind = "propose"
-	CommandReview  CommandKind = "review"
-	CommandApprove CommandKind = "approve"
+	CommandEdit    CommandKind = "edit"
+	CommandTalk    CommandKind = "talk"
+	CommandMemo    CommandKind = "memo"
 	CommandSwitch  CommandKind = "switch"
-	CommandDenied  CommandKind = "denied"
 	CommandRoute   CommandKind = "route"
 )
 
 type Preview struct {
-	Kind        CommandKind
-	Action      string
-	Target      string
-	Tab         string
-	Pending     bool
-	ProposalID  string
-	ReviewLabel string
+	Kind    CommandKind
+	Action  string
+	Target  string
+	Tab     string
+	Pending bool
 }
 
 func (p Preview) Summary() string {
 	if !p.Pending {
 		return ""
 	}
-
-	base := p.Action + " -> " + p.Target + " @ " + p.Tab
-	if p.ProposalID == "" {
-		return base
-	}
-
-	return fmt.Sprintf("%s [%s]", base, p.ProposalID)
+	return fmt.Sprintf("%s -> %s @ %s", p.Action, p.Target, p.Tab)
 }
 
-func BuildPreview(input, scope, tab string, locked bool) Preview {
+func BuildPreview(input, scope, tab string) Preview {
 	normalized := strings.ToLower(strings.TrimSpace(input))
 	kind, action := parseAction(normalized)
-	preview := Preview{
-		Kind:        kind,
-		Action:      action,
-		Target:      scope,
-		Tab:         tab,
-		Pending:     true,
-		ReviewLabel: reviewLabelFor(kind),
+	return Preview{
+		Kind:    kind,
+		Action:  action,
+		Target:  scope,
+		Tab:     tab,
+		Pending: true,
 	}
+}
 
-	if locked && kind != CommandInspect && kind != CommandReview {
-		preview.Kind = CommandDenied
-		preview.Action = "deny change in locked region"
-		preview.ReviewLabel = "locked"
-		return preview
+func commandRequiresConfirmation(kind CommandKind) bool {
+	switch kind {
+	case CommandTalk, CommandInspect:
+		return false
+	default:
+		return true
 	}
-
-	if preview.Kind == CommandPropose || preview.Kind == CommandReview || preview.Kind == CommandApprove {
-		preview.ProposalID = proposalIDFor(tab, scope)
-	}
-
-	return preview
 }
 
 func parseAction(input string) (CommandKind, string) {
 	switch {
 	case input == "":
 		return CommandRoute, "no-op"
+	case isMemoCommand(input):
+		return CommandMemo, "save memo for current file"
+	case isGreeting(input):
+		return CommandTalk, "talk with edit agent"
 	case strings.Contains(input, "inspect") || strings.Contains(input, "check") || strings.Contains(input, "explain"):
-		return CommandInspect, "inspect current context"
-	case strings.Contains(input, "rename"):
-		return CommandPropose, "prepare rename preview"
-	case strings.Contains(input, "simplify") || strings.Contains(input, "refactor") || strings.Contains(input, "patch"):
-		return CommandPropose, "propose bounded refactor"
-	case strings.Contains(input, "diff") || strings.Contains(input, "review") || strings.Contains(input, "highlight"):
-		return CommandReview, "show diff review"
-	case strings.Contains(input, "hold"):
-		return CommandReview, "hold for review"
-	case strings.Contains(input, "approve") || strings.Contains(input, "apply"):
-		return CommandApprove, "approve pending proposal"
+		return CommandInspect, "inspect current scope"
+	case strings.Contains(input, "rename") || strings.Contains(input, "simplify") || strings.Contains(input, "refactor") || strings.Contains(input, "patch") || strings.Contains(input, "edit") || strings.Contains(input, "rewrite"):
+		return CommandEdit, "edit current scope"
 	case strings.Contains(input, "switch") && strings.Contains(input, "tab"):
 		return CommandSwitch, "switch tab context"
 	default:
-		return CommandRoute, "route command through control hub"
+		return CommandRoute, "resolve against active edit context"
 	}
 }
 
-func reviewLabelFor(kind CommandKind) string {
-	switch kind {
-	case CommandInspect:
-		return "analysis"
-	case CommandPropose:
-		return "proposal"
-	case CommandReview:
-		return "review"
-	case CommandApprove:
-		return "approval"
-	case CommandSwitch:
-		return "navigation"
-	case CommandDenied:
-		return "denied"
+func isMemoCommand(input string) bool {
+	_, ok := memoCommandPayload(input)
+	return ok
+}
+
+func memoCommandPayload(input string) (string, bool) {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return "", false
+	}
+	if strings.HasPrefix(trimmed, "memo ") {
+		return strings.TrimSpace(strings.TrimPrefix(trimmed, "memo ")), true
+	}
+	if strings.HasPrefix(trimmed, "메모 ") {
+		return strings.TrimSpace(strings.TrimPrefix(trimmed, "메모 ")), true
+	}
+	if strings.Contains(trimmed, "메모해") {
+		return trimmed, true
+	}
+	return "", false
+}
+
+func isGreeting(input string) bool {
+	trimmed := strings.TrimSpace(input)
+	switch trimmed {
+	case "hello", "hi", "hey", "안녕", "안녕하세요", "반가워", "반갑습니다":
+		return true
 	default:
-		return "control"
+		return false
 	}
-}
-
-func proposalIDFor(tab, scope string) string {
-	tabToken := strings.ToUpper(strings.TrimSuffix(tab, ".go"))
-	tabToken = strings.TrimSuffix(tabToken, ".DIFF")
-	tabToken = strings.TrimSuffix(tabToken, ".MD")
-	tabToken = strings.ReplaceAll(tabToken, " ", "-")
-	if tabToken == "" {
-		tabToken = "TAB"
-	}
-	scopeToken := strings.NewReplacer(":", "-", ".", "-", "/", "-").Replace(scope)
-	return tabToken + "-" + scopeToken
 }

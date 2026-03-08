@@ -25,7 +25,7 @@ Control must be shared, but the sharing must be explicit.
 
 - the user should understand who currently leads
 - the user should understand what scope is active
-- the user should understand whether the current step is suggestive, reviewable, or applying
+- the user should understand whether the current step is being scoped, previewed, or confirmed
 
 ## Recommended State Model
 
@@ -43,39 +43,33 @@ Phase 2 should keep the handoff model small and visible.
 - the agent returns suggestions or patch candidates
 - the agent does not yet own final application authority
 
-### Review-Pending
+### Previewing
 
-- a patch or suggested change is available for human review
-- the user can accept, reject, or refine the proposal
+- a scoped action is visible to the human before confirmation
+- the user can confirm, edit, or cancel the request
 - this is the default safety buffer for meaningful agent edits
 
-### Applying
+### Confirming
 
-- the selected proposal is being applied to the allowed scope
+- the current scoped command is being confirmed against the allowed scope
 - application should remain bounded and visible
-
-### Locked / Denied
-
-- the requested or proposed change conflicts with a lock, forbidden range, or explicit constraint
-- the system must expose that denial rather than silently widening scope
 
 ## Transition Table
 
 | From | Trigger | To |
 |------|---------|----|
 | Human-Led | ask for inspection or patch | Agent-Suggesting |
-| Agent-Suggesting | proposal ready | Review-Pending |
-| Review-Pending | user approves | Applying |
-| Review-Pending | user rejects or cancels | Human-Led |
-| Any | target hits locked scope | Locked / Denied |
-| Applying | patch completes | Human-Led |
+| Agent-Suggesting | preview ready | Previewing |
+| Previewing | user confirms | Confirming |
+| Previewing | user edits or cancels | Human-Led |
+| Confirming | scoped action completes | Human-Led |
 
 ## Canonical Collaboration Patterns
 
 These are the intended rhythms of work:
 
 - human-led edit -> agent impact analysis
-- agent proposal -> human approval
+- agent suggestion -> human confirmation
 - human direct patch -> agent coherence check
 - agent draft -> human fine adjustment
 - human review of agent patch before merge into active state
@@ -86,8 +80,8 @@ The handoff model must not be hidden behind vague AI activity.
 
 - current initiative should be visible in status language
 - current target scope should be visible
-- proposal vs applied state should be visible
-- denied or locked actions should be visible
+- preview vs confirmed state should be visible
+- rejected scope should be visible
 
 ## Authority Model
 
@@ -99,25 +93,25 @@ In early `gdedit`, suggestion authority comes before automatic edit authority.
 
 ## Relationship to Review
 
-Review is not a bolt-on stage. It is part of the handoff contract.
+Preview is not a bolt-on stage. It is part of the handoff contract.
 
-- suggestion -> review -> apply is the normal path
-- the review layer reduces confusion when control shifts from human to agent and back
-- review protects local human intent from broad, opaque rewrite behavior
+- suggestion -> preview -> confirm is the normal path
+- the preview layer reduces confusion when control shifts from human to agent and back
+- preview protects local human intent from broad, opaque rewrite behavior
 
-## Relationship to Locked Regions
+## Relationship to Scope
 
-Locked regions are not an edge case. They are a core handoff boundary.
+Visible scope is the core handoff boundary.
 
-- the human may reserve parts of the editing surface from agent modification
-- the system may deny or constrain proposals that cross protected boundaries
-- denied state must remain visible rather than silently falling back to broader behavior
+- the human may select or point to the part of the editing surface under discussion
+- the system may ask for narrower scope when the request is too broad
+- rejected scope must remain visible rather than silently falling back to broader behavior
 
 ## Failure Modes to Avoid
 
 - unclear initiative ownership
 - silent agent takeover
-- reviewless patch application for non-trivial changes
+- previewless scoped application for non-trivial changes
 - hidden scope widening
 - multi-context edits without explicit transition
 
@@ -127,9 +121,8 @@ The actual implementation may later refine internal names, but the user-facing s
 
 - human-led
 - agent-suggesting
-- review-pending
-- applying
-- locked/denied
+- previewing
+- confirming
 
 If more states are added later, they should improve clarity rather than increase mode burden.
 
@@ -139,6 +132,6 @@ Phase 2 control-handoff documentation is complete when it clearly defines:
 
 - why shared control exists
 - the visible handoff states
-- how proposals move into review and then apply
-- how denial and locking work
+- how scoped actions move into preview and then confirmation
+- how rejected scope is surfaced
 - why suggestion authority comes before automatic edit authority

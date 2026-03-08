@@ -104,13 +104,20 @@
   - `Ctrl+X` cuts the selected text.
   - `Ctrl+V` pastes at the caret or replaces the current selection.
   - multiline paste creates real lines.
+- Added system clipboard integration with internal fallback via `github.com/atotto/clipboard`.
+- Extended the Control Hub into a one-line selection-aware input:
+  - `Ctrl+A` selects the full command.
+  - `Shift` / `Alt` movement expands or shrinks the input selection.
+  - `Ctrl+C` / `Ctrl+X` / `Ctrl+V` now copy, cut, and paste or replace the current input selection.
 - Added richer keyboard movement:
   - `Home` / `End`
   - `PageUp` / `PageDown`
   - `Ctrl+Left` / `Ctrl+Right` word movement
   - `Ctrl+Shift+Left` / `Ctrl+Shift+Right` word selection
   - `Ctrl+Alt+Left` / `Ctrl+Alt+Right` word-movement fallback
+- Added `Ctrl+A` in the editor to select the entire document for full replacement flows.
 - Normalized terminal selection modifiers so `Shift`, `Alt`, and `Shift+Alt` all extend selection on supported movement keys.
+- Simplified the collaboration model away from line-level locks, proposal queues, and handoff-denial states; current scope now acts as the single user/agent boundary for discussion and edits.
 - Changed indentation policy to user-directed editing:
   - `Tab` inserts a literal `\t` when there is no selection.
   - `Tab` indents only the active selection.

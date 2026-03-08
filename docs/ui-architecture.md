@@ -6,9 +6,9 @@ This document defines the Phase 1 UI structure for `gdedit`. It freezes the layo
 
 ## Core Layout Principle
 
-`gdedit` has one representative control hub and multiple edit contexts.
+`gdedit` has one scoped control hub and multiple edit contexts.
 
-- control is centralized
+- editing control is concentrated in one place
 - editing contexts are separated
 - status remains visible
 - optional supporting panels stay secondary
@@ -27,7 +27,7 @@ Primary layout direction:
 
 ```text
 +--------------------------------------------------------------+
-| Tabs: [main.go] [doctor-report] [patch-review] [notes]       |
+| Tabs: [main.go] [doctor-report] [file-memo] [notes]         |
 +--------------------------------------------------------------+
 |                                                              |
 |                      Active Edit Surface                     |
@@ -36,10 +36,10 @@ Primary layout direction:
 |                                                              |
 +-----------------------------------+--------------------------+
 | Control Hub                       | Status Surface           |
-| > inspect recent edit             | tab: main.go             |
+| > note why this block exists      | tab: main.go             |
 |   current scope: selection        | scope: selection         |
-|   preview: pending                | agent: idle              |
-|                                   | review: 1 pending        |
+|   preview: pending                | agent: preview           |
+|                                   | command: note current... |
 +-----------------------------------+--------------------------+
 ```
 
@@ -47,15 +47,15 @@ Primary layout direction:
 
 ```text
 +--------------------------------------------------+
-| Tabs: [main.go] [review] [notes]                 |
+| Tabs: [main.go] [memo] [notes]                   |
 +--------------------------------------------------+
 |                                                  |
 |                Active Edit Surface               |
 |                                                  |
 +-----------------------------+--------------------+
 | Control Hub                 | Status             |
-| > rename this function      | tab: main.go       |
-|                             | agent: suggest     |
+| > explain this setting      | tab: main.go       |
+|                             | agent: scoping     |
 +-----------------------------+--------------------+
 ```
 
@@ -75,16 +75,17 @@ Primary layout direction:
 
 ### Control Hub
 
-- The single place for control input.
+- The single place for scoped editing input.
 - Accepts typed commands and voice-injected text.
-- Supports preview, confirmation, and agent invocation.
+- Supports preview, confirmation, and edit-agent interaction.
 - Operates against the active tab and its current local context.
+- May later create durable text artifacts such as memos or handoff notes tied to that context.
 
 ### Status Surface
 
 - Displays compact, high-value state.
 - Must behave like a dashboard, not a log dump.
-- Should summarize current context, agent status, review state, and target scope.
+- Should summarize current context, agent status, current command state, and target scope.
 
 ### Optional Secondary Panels
 
@@ -122,7 +123,7 @@ Every control action should resolve against:
 - current selection
 - current project/workspace state
 
-This lets users learn one control hub without sacrificing context precision.
+This lets users learn one control hub without sacrificing context precision, file meaning, or durable intent capture.
 
 ## Layout Philosophy
 

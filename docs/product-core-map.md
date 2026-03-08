@@ -15,16 +15,17 @@ This document turns the scattered product concepts in `dev-guide/2026-03-06_18-0
 ### 1. Control Hub
 
 Definition:
-- The control hub is the single representative control window for agent invocation, text commands, voice-injected commands, confirmation, and review entry.
+- The control hub is the single scoped control window for edit-agent interaction, text commands, voice-injected commands, preview, confirmation, and memo capture.
 
 Why it exists:
 - It gives `gdedit` one stable place where control happens.
 - It prevents command behavior from being split across multiple competing control surfaces.
 - It keeps voice and text on the same path.
+- It keeps user intent close to the current file, selection, and caret.
 
 Downstream impact:
 - Later UI docs must preserve exactly one primary control hub.
-- Control commands, previews, and approvals should route through the same place.
+- Control commands, previews, confirmations, and memo actions should pass through the same place.
 - Voice should land in the control hub before execution.
 
 ### 2. Edit Tabs
@@ -47,7 +48,7 @@ Definition:
 - The status surface is the persistent state summary area that reports what the editor knows right now.
 
 Why it exists:
-- `gdedit` needs explicit visibility of mode, scope, agent state, review state, and command results.
+- `gdedit` needs explicit visibility of mode, scope, agent state, command state, and command results.
 - It is not just a thin status bar; it is a compact context dashboard.
 
 Primary examples:
@@ -55,7 +56,7 @@ Primary examples:
 - project name
 - selection range
 - agent state
-- last proposal result
+- current preview or last confirmed command
 - voice status
 - target scope
 - highlight summary
@@ -70,13 +71,14 @@ Definition:
 - The AI in `gdedit` is an edit agent, not a coding agent.
 
 Why it exists:
-- `gdedit` is built around local refinement, patching, and review.
+- `gdedit` is built around local refinement, patching, memo capture, and confirmation.
 - The product rejects the idea that the best AI collaborator is a broad rewrite engine.
 
 Primary responsibilities:
 - understand current editing context
 - find relevant positions
-- propose partial edits
+- propose scoped edits
+- capture durable notes tied to a file or scope
 - inspect likely impact range
 - verify local coherence
 - explain the change
@@ -84,11 +86,11 @@ Primary responsibilities:
 Non-responsibilities:
 - broad opaque rewrites by default
 - detached chat-only generation as the primary flow
-- ignoring current cursor, selection, diff, or locked state
+- ignoring current cursor, selection, diff, or current file intent
 
 Downstream impact:
-- Later agent docs must define hard scope boundaries and proposal flow.
-- Review-first patch handling should remain the default.
+- Later agent docs must define hard scope boundaries and memo/file-artifact handling.
+- Preview-first scoped handling should remain the default.
 
 ### 5. Control Handoff
 
@@ -97,18 +99,18 @@ Definition:
 
 Why it exists:
 - The product is not fully manual and not fully automatic.
-- The value comes from semi-automatic collaboration with explicit control exchange.
+- The value comes from semi-automatic collaboration with explicit control exchange and durable intent capture.
 
 Typical states:
 - human-led editing
-- agent-suggesting
-- review-pending
-- approved/applying
-- locked/denied
+- scoping
+- previewing
+- confirming
+- returning to direct editing
 
 Downstream impact:
 - Later docs need a state model for handoff.
-- Agent actions must be previewable and reversible.
+- Agent actions must be previewable and scoped.
 - The user should always understand who currently has initiative and where.
 
 ### 6. Control Mode
@@ -135,7 +137,7 @@ Definition:
 
 Why it exists:
 - Ambient listening creates noise, ambiguity, and trust problems.
-- Voice is strongest when it carries intent into a controlled, reviewable path.
+- Voice is strongest when it carries intent into a controlled, scoped path.
 
 Expected flow:
 - focus control hub
@@ -147,8 +149,8 @@ Expected flow:
 Good command classes:
 - ask for inspection
 - ask for bounded refactor
-- request diff/review
-- confirm/hold proposal
+- record a memo for this file
+- confirm scoped action
 - switch tab or panel
 
 Downstream impact:
@@ -167,26 +169,54 @@ Why it exists:
 Layer model:
 - base highlighting: syntax, symbol, search, diagnostics
 - editing highlighting: recent edits, selection, diff, unsaved changes
-- cowork highlighting: agent focus, proposed changes, review needed, impact range, locked region, conflict risk, approval wait
+- cowork highlighting: agent focus, scoped impact range, memo-linked focus, conflict risk, confirmation wait
 
 Downstream impact:
 - Later UI docs need a stable taxonomy for state overlays.
 - Reduced-color terminals need a fallback marker strategy.
 
-### 9. Workstyle System
+### 9. Memo Records
+
+Definition:
+- Memo records are durable plain-text artifacts that preserve user intent, edit-agent intent, emerging needs, and conflict-resolution history around a file or scoped region.
+
+Storage model:
+- system and app memos belong under the system memo root configured in `~/.config/gdedit/config.json`
+- project memos belong inside the relevant project's `.gdedit/` directory so they travel with project-specific intent, implementation notes, and local conflict history
+- memo files should stay portable enough to move to another system when they help reproduce or adapt settings there
+- memo files should be written so AI models can read them and act on them reliably
+
+Why it exists:
+- Users often repeat setup and configuration trial-and-error across systems.
+- Local edits are easy to make, but hard to carry consistently into later environments without a durable record.
+- The assistant becomes more useful when it can read and extend the user's own implementation history instead of relying on fragile conversation memory.
+
+Primary roles:
+- record why a file, setting, or scoped edit matters
+- record new needs discovered during setup or editing
+- record conflicts and how they were resolved
+- provide assistant-readable context for later work on the same system or a different system
+- help carry working setup knowledge from one system to another when direct reuse is otherwise fragile
+
+Downstream impact:
+- Later docs should define concrete memo file naming, the `config.json` key for the system memo root, project-local `.gdedit/` memo layout, and tab behavior.
+- Memo records should be addressable from the control hub as part of normal editing flow.
+- External-agent mediation, when added later, should prefer memo-backed delegation over chat-only context passing.
+
+### 10. Workstyle System
 
 Definition:
 - Shortcuts in `gdedit` are part of a workstyle package, not just a command map.
 
 Why it exists:
 - The product aims to encode editing methodology, not only key bindings.
-- A workstyle can bundle keymap, panel habits, review flow, agent behavior, and task preference.
+- A workstyle can bundle keymap, panel habits, memo habits, agent behavior, and task preference.
 
 Example dimensions:
 - keymap
 - panel/tab habits
-- agent invocation rules
-- review defaults
+- edit-agent invocation rules
+- confirmation defaults
 - language-specific editing habits
 - mouse usage level
 
@@ -212,7 +242,8 @@ This is a direction, not a frozen implementation spec. The precise layout belong
 - multiple edit tabs
 - control routed by active tab, cursor, selection, and current project context
 - voice only through the control hub
-- reviewable patch flow over opaque rewrite flow
+- scoped preview/confirm flow over opaque rewrite flow
+- durable plain-text memo flow for user intent and conflict history
 - highlighting used as collaboration-state semantics
 - workstyle recommendations allowed, forced style mutation not allowed
 
@@ -231,4 +262,4 @@ This is a direction, not a frozen implementation spec. The precise layout belong
 
 ## Source Notes
 
-This map is derived from the product planning discussion in `dev-guide/2026-03-06_18-07-11_ChatGPT_1._터미널 에디터 기획(gdedit).md`, especially the sections on edit agents, control-mode-as-focus, representative control hub, voice restriction, collaborative highlighting, and workstyle-oriented shortcuts.
+This map is derived from the product planning discussion in `dev-guide/2026-03-06_18-07-11_ChatGPT_1._터미널 에디터 기획(gdedit).md`, especially the sections on edit agents, control-mode-as-focus, scoped control hub, voice restriction, collaborative highlighting, durable memo capture, and workstyle-oriented shortcuts.

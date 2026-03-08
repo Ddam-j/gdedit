@@ -1,4 +1,19 @@
-# Multi-platform Ops + Project Operations (gdedit)
+# Delivery Plan: Multi-platform Support and Release Operations
+
+## Scope Note
+
+This document is a historical delivery and release-planning document.
+
+- it does not define the current product identity of `gdedit`
+- the live product philosophy is editing-first assistance around the active text surface
+- durable memos, file intent, and scoped edit-agent interaction now define the assistant direction more than generic project operations language
+
+When this document conflicts with newer product docs, prefer:
+
+- `docs/product-vision.md`
+- `docs/control-panel.md`
+- `docs/edit-agent.md`
+- `docs/product-core-map.md`
 
 ## TL;DR
 > **Summary**: Define a portability contract and set up repeatable CI/release automation so `gdedit` can ship on Windows (PowerShell terminals), Linux, and macOS (incl. SSH usage) with public-commit hygiene.

@@ -27,7 +27,7 @@ In short:
 
 - a visible work context
 - what the user actively switches between
-- may reflect one file, one review target, one comparison target, or one focused task thread
+- may reflect one file, one memo target, one comparison target, or one focused task thread
 
 ### Buffer
 
@@ -49,7 +49,7 @@ Minimum conceptual payload:
 - active buffer/file identity
 - local cursor and selection state
 - local recent edit context
-- local review/proposal context
+- local note or memo context
 - local collaboration highlights relevant to that tab
 
 ## Shared vs Local State
@@ -65,8 +65,7 @@ Minimum conceptual payload:
 
 - editing content
 - cursor/selection
-- local review state
-- local proposal state
+- local memo state
 - local visual context
 
 ## Control Routing Rule
@@ -86,7 +85,7 @@ The user learns one control system, while the active tab supplies the local targ
 
 ### Open
 
-- create a new editing context for a file, task, comparison, or review target
+- create a new editing context for a file, task, comparison, or memo target
 
 ### Activate
 
@@ -95,12 +94,12 @@ The user learns one control system, while the active tab supplies the local targ
 
 ### Update
 
-- maintain local cursor, selection, recent edits, and pending review state
+- maintain local cursor, selection, recent edits, and any local memo state
 
 ### Close
 
 - remove the visible editing context while preserving broader session rules
-- if the closed tab has unsaved or unreviewed state, later implementation must define guardrails
+- if the closed tab has unsaved or unresolved memo state, later implementation must define guardrails
 
 ## Naming Guidance
 
@@ -110,7 +109,7 @@ Prefer names that reflect:
 
 - file identity
 - task identity
-- review identity
+- memo identity
 - comparison identity
 
 Avoid vague generic names when a clearer local purpose exists.
@@ -125,7 +124,7 @@ Implications:
 
 - an agent request should not silently jump to another tab
 - a control action should not silently affect multiple tabs by default
-- cross-tab or multi-context actions must be made explicit and reviewable
+- cross-tab or multi-context actions must be made explicit and scope-readable
 
 ## Tabs and Panels Are Not The Same
 
@@ -137,7 +136,7 @@ Implications:
 Examples:
 
 - tab: `main.go`
-- tab: `review patch`
+- tab: `file memo`
 - panel later: diff detail
 - panel later: reference detail
 
