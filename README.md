@@ -128,3 +128,4 @@ gdedit --doctor
 ```
 
 You should see the loaded config path plus fields like `memo_root`, `edit_agent_provider`, `edit_agent_model`, and `edit_agent_status`.
+.
