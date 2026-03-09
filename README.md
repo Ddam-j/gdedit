@@ -57,7 +57,7 @@ AI 에이전트를 포함한 터미널 cowork editor 프로토타입이다. WezT
 - Control Hub confirm now executes the configured edit agent against the current scope and accepts either a scoped replacement or a message-only response.
 - Live edit-agent requests now include memo context from the configured system memo root and the current project's `.gdedit/` directory when those files exist.
 
-Example:
+`config.json` example:
 
 ```json
 {
@@ -71,3 +71,60 @@ Example:
   }
 }
 ```
+
+What each field means:
+
+- `memoRoot`: system/app memo root. `~` is expanded to your home directory and the path is normalized with a trailing `/`.
+- `editAgent.enabled`: turns the external edit agent on or off.
+- `editAgent.role`: label shown in `--doctor` and UI summaries. The default is `edit-agent`.
+- `editAgent.provider`: currently `openai` is supported.
+- `editAgent.model`: model name sent to the provider, for example `gpt-5.4`.
+- `editAgent.apiKeyEnv`: environment variable name that stores the API key, for example `OPENAI_API_KEY`.
+- `editAgent.baseURL`: optional custom OpenAI-compatible endpoint. Leave it out when using the default OpenAI API.
+
+Defaults when the file does not exist:
+
+```json
+{
+  "memoRoot": "~/gdedit/",
+  "editAgent": {
+    "enabled": true,
+    "role": "edit-agent",
+    "provider": "openai",
+    "model": "gpt-5.4",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  }
+}
+```
+
+Practical setup flow:
+
+1. Create `~/.config/gdedit/config.json`.
+2. Set your API key in the shell, for example `OPENAI_API_KEY`.
+3. Keep system and app memos under `memoRoot`.
+4. Open a project normally; project-local memos are stored under that project's `.gdedit/` directory.
+5. Run `gdedit --doctor` to confirm the config path, memo root, provider, model, and API-key readiness.
+
+Example with a custom endpoint:
+
+```json
+{
+  "memoRoot": "~/gdedit/",
+  "editAgent": {
+    "enabled": true,
+    "role": "edit-agent",
+    "provider": "openai",
+    "model": "gpt-5.4",
+    "apiKeyEnv": "OPENAI_API_KEY",
+    "baseURL": "https://api.openai.com/v1"
+  }
+}
+```
+
+Verification:
+
+```bash
+gdedit --doctor
+```
+
+You should see the loaded config path plus fields like `memo_root`, `edit_agent_provider`, `edit_agent_model`, and `edit_agent_status`.
