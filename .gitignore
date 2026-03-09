@@ -30,3 +30,17 @@ go.work.sum
 # Editor/IDE
 .idea/
 .vscode/
+
+# Local gdedit state
+.gdedit/
+.sisyphus/
+dist/
+
+# Local release/helper scripts
+git_phase6_*.cmd
+git_push_*.cmd
+tmux_*.sh
+
+# Local scratch files
+im.text
+item.label)
