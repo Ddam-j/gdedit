@@ -13,12 +13,38 @@ import (
 
 var loadConfig = config.Load
 
+type launchMode int
+
+const (
+	launchScratch launchMode = iota
+	launchVersion
+	launchDoctor
+	launchHelp
+	launchFile
+	launchTest
+)
+
 func main() {
 	exitCode := run(os.Args[1:], os.Stdout, os.Stderr)
 	os.Exit(exitCode)
 }
 
 func run(args []string, stdout, stderr *os.File) int {
+	mode, filePath, err := resolveLaunch(args)
+	if err != nil {
+		printUsage(stderr)
+		return 2
+	}
+
+	switch mode {
+	case launchVersion:
+		fmt.Fprintln(stdout, version.String())
+		return 0
+	case launchHelp:
+		printUsage(stdout)
+		return 0
+	}
+
 	loadedConfig, err := loadConfig()
 	if err != nil {
 		fprintf(stderr, "failed to load gdedit config: %v\n", err)
@@ -37,37 +63,24 @@ func run(args []string, stdout, stderr *os.File) int {
 		return 1
 	}
 
-	if len(args) == 0 {
-		if err := tui.NewWithAgent(loadedConfig.Config.EditAgent.Summary(), editAgent, workspace, loadedConfig.Config.MemoRoot).Run(); err != nil {
-			fprintf(stderr, "failed to run gdedit shell: %v\n", err)
-			return 1
-		}
-		return 0
-	}
-
-	if len(args) > 1 {
-		printUsage(stderr)
-		return 2
-	}
-
-	switch args[0] {
-	case "--version":
-		fmt.Fprintln(stdout, version.String())
-		return 0
-	case "--doctor":
+	switch mode {
+	case launchDoctor:
 		reportDoctor(stdout, loadedConfig)
 		return 0
-	case "--tui":
+	case launchScratch:
+		if err := tui.NewScratchWithAgent(loadedConfig.Config.EditAgent.Summary(), editAgent, workspace, loadedConfig.Config.MemoRoot).Run(); err != nil {
+			fprintf(stderr, "failed to run gdedit shell: %v\n", err)
+			return 1
+		}
+		return 0
+	case launchTest:
 		if err := tui.NewWithAgent(loadedConfig.Config.EditAgent.Summary(), editAgent, workspace, loadedConfig.Config.MemoRoot).Run(); err != nil {
 			fprintf(stderr, "failed to run gdedit shell: %v\n", err)
 			return 1
 		}
 		return 0
-	case "-h", "--help":
-		printUsage(stdout)
-		return 0
-	default:
-		app, err := tui.NewWithFiles(loadedConfig.Config.EditAgent.Summary(), editAgent, workspace, loadedConfig.Config.MemoRoot, []string{args[0]})
+	case launchFile:
+		app, err := tui.NewWithFiles(loadedConfig.Config.EditAgent.Summary(), editAgent, workspace, loadedConfig.Config.MemoRoot, []string{filePath})
 		if err != nil {
 			fprintf(stderr, "failed to open file: %v\n", err)
 			return 1
@@ -77,12 +90,38 @@ func run(args []string, stdout, stderr *os.File) int {
 			return 1
 		}
 		return 0
+	default:
+		printUsage(stderr)
+		return 2
 	}
 }
 
 func printUsage(out *os.File) {
-	fmt.Fprintln(out, "Usage: gdedit [--version|--doctor|--tui|<file>]")
-	fmt.Fprintln(out, "Run without arguments to start the minimal shell, or pass a file path to open it directly.")
+	fmt.Fprintln(out, "Usage: gdedit [--help|--version|--doctor|--tui|<file>]")
+	fmt.Fprintln(out, "Run without arguments to start a scratch buffer, or pass a file path to open it directly.")
+}
+
+func resolveLaunch(args []string) (launchMode, string, error) {
+	if len(args) == 0 {
+		return launchScratch, "", nil
+	}
+	if len(args) > 1 {
+		return launchHelp, "", fmt.Errorf("too many arguments")
+	}
+	switch args[0] {
+	case "--version":
+		return launchVersion, "", nil
+	case "--doctor":
+		return launchDoctor, "", nil
+	case "--tui":
+		return launchScratch, "", nil
+	case "--test":
+		return launchTest, "", nil
+	case "-h", "--help":
+		return launchHelp, "", nil
+	default:
+		return launchFile, args[0], nil
+	}
 }
 
 func reportDoctor(out *os.File, loaded config.Loaded) {

@@ -55,6 +55,8 @@ type Tab struct {
 	Title            string
 	FilePath         string
 	Content          []string
+	TrailingNewline  bool
+	Dirty            bool
 	Locked           map[int]bool
 	ViewTop          int
 	ViewLeft         int
@@ -115,17 +117,32 @@ func New() *App {
 	return NewWithAgent("", nil, "", "")
 }
 
+func NewScratch() *App {
+	return NewScratchWithAgent("", nil, "", "")
+}
+
 func NewWithAgentProfile(agentProfile string) *App {
 	return NewWithAgent(agentProfile, nil, "", "")
 }
 
 func NewWithAgent(agentProfile string, executor agent.Executor, workspaceRoot, systemMemoRoot string) *App {
+	return newApp(sampleTabs(), agentProfile, executor, workspaceRoot, systemMemoRoot, "Ready. Ctrl+G focuses the control hub.")
+}
+
+func NewScratchWithAgent(agentProfile string, executor agent.Executor, workspaceRoot, systemMemoRoot string) *App {
+	return newApp([]Tab{scratchTab()}, agentProfile, executor, workspaceRoot, systemMemoRoot, "Ready. Open a file or start typing. Ctrl+S saves file-backed tabs.")
+}
+
+func newApp(tabs []Tab, agentProfile string, executor agent.Executor, workspaceRoot, systemMemoRoot, statusMessage string) *App {
+	if len(tabs) == 0 {
+		tabs = []Tab{scratchTab()}
+	}
 	return &App{
-		tabs:                sampleTabs(),
+		tabs:                tabs,
 		focus:               focusEditor,
 		selectionAnchor:     -1,
 		controlSelectAnchor: -1,
-		statusMessage:       "Ready. Ctrl+G focuses the control hub.",
+		statusMessage:       statusMessage,
 		voiceState:          "off",
 		indentWidth:         defaultIndent,
 		agentProfile:        agentProfile,
@@ -136,7 +153,7 @@ func NewWithAgent(agentProfile string, executor agent.Executor, workspaceRoot, s
 }
 
 func NewWithFiles(agentProfile string, executor agent.Executor, workspaceRoot, systemMemoRoot string, filePaths []string) (*App, error) {
-	app := NewWithAgent(agentProfile, executor, workspaceRoot, systemMemoRoot)
+	app := NewScratchWithAgent(agentProfile, executor, workspaceRoot, systemMemoRoot)
 	if len(filePaths) == 0 {
 		return app, nil
 	}
@@ -146,6 +163,14 @@ func NewWithFiles(agentProfile string, executor agent.Executor, workspaceRoot, s
 	}
 	app.tabs = tabs
 	return app, nil
+}
+
+func scratchTab() Tab {
+	return Tab{
+		Title:            "untitled",
+		Content:          []string{""},
+		SelectionAnchorY: -1,
+	}
 }
 
 func sampleTabs() []Tab {
@@ -219,9 +244,19 @@ func loadTabsFromPaths(filePaths []string) ([]Tab, error) {
 		}
 		content, err := os.ReadFile(absPath)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				tabs = append(tabs, Tab{
+					Title:            filepath.Base(absPath),
+					FilePath:         absPath,
+					Content:          []string{""},
+					SelectionAnchorY: -1,
+				})
+				continue
+			}
 			return nil, err
 		}
 		text := strings.ReplaceAll(string(content), "\r\n", "\n")
+		trailingNewline := strings.HasSuffix(text, "\n")
 		lines := strings.Split(text, "\n")
 		if len(lines) == 0 {
 			lines = []string{""}
@@ -233,6 +268,7 @@ func loadTabsFromPaths(filePaths []string) ([]Tab, error) {
 			Title:            filepath.Base(absPath),
 			FilePath:         absPath,
 			Content:          lines,
+			TrailingNewline:  trailingNewline,
 			SelectionAnchorY: -1,
 		})
 	}
@@ -455,6 +491,9 @@ func (a *App) handleEditorKey(ev *tcell.EventKey) bool {
 	case tcell.KeyCtrlA:
 		a.selectAllEditor()
 		return false
+	case tcell.KeyCtrlS:
+		a.saveActiveTab()
+		return false
 	case tcell.KeyCtrlC:
 		a.copySelection()
 		return false
@@ -511,6 +550,7 @@ func (a *App) insertRune(r rune) {
 	line = append(line[:a.cursorX], append([]rune{r}, line[a.cursorX:]...)...)
 	line, a.cursorX = normalizeInsertedRunes(line, a.cursorX+1)
 	a.tabs[a.activeTab].Content[a.cursorY] = string(line)
+	a.markActiveTabDirty()
 	a.statusMessage = "Inserted text in active edit surface."
 }
 
@@ -551,6 +591,7 @@ func (a *App) insertTextAtCaret(text string) {
 	}
 	updated = append(updated, content[originalY+1:]...)
 	a.tabs[a.activeTab].Content = updated
+	a.markActiveTabDirty()
 	a.statusMessage = "Inserted text in active edit surface."
 	a.ensureCursorInBounds()
 }
@@ -606,6 +647,7 @@ func (a *App) insertNewLine() {
 	updated = append(updated, before, after)
 	updated = append(updated, content[a.cursorY+1:]...)
 	a.tabs[a.activeTab].Content = updated
+	a.markActiveTabDirty()
 	a.cursorY++
 	a.cursorX = 0
 	a.statusMessage = "Inserted a new line."
@@ -620,6 +662,7 @@ func (a *App) insertLineAbove() {
 	updated = append(updated, "")
 	updated = append(updated, content[a.cursorY:]...)
 	a.tabs[a.activeTab].Content = updated
+	a.markActiveTabDirty()
 	a.cursorY = originalLine + 1
 	a.cursorX = originalColumn
 	a.statusMessage = fmt.Sprintf("Inserted a blank line above line %d while keeping the caret on its content line.", a.cursorY+1)
@@ -636,6 +679,7 @@ func (a *App) removeBlankLineAbove() {
 		return
 	}
 	a.tabs[a.activeTab].Content = append(a.tabs[a.activeTab].Content[:index], a.tabs[a.activeTab].Content[index+1:]...)
+	a.markActiveTabDirty()
 	a.cursorY--
 	a.statusMessage = fmt.Sprintf("Removed the blank line above line %d.", a.cursorY+1)
 }
@@ -650,6 +694,7 @@ func (a *App) backspaceEditor() {
 		line := []rune(a.tabs[a.activeTab].Content[a.cursorY])
 		line = append(line[:a.cursorX-1], line[a.cursorX:]...)
 		a.tabs[a.activeTab].Content[a.cursorY] = string(line)
+		a.markActiveTabDirty()
 		a.cursorX--
 		a.statusMessage = "Deleted previous character."
 		return
@@ -664,6 +709,7 @@ func (a *App) backspaceEditor() {
 	current := a.tabs[a.activeTab].Content[a.cursorY]
 	a.tabs[a.activeTab].Content[prevIndex] = prev + current
 	a.tabs[a.activeTab].Content = append(a.tabs[a.activeTab].Content[:a.cursorY], a.tabs[a.activeTab].Content[a.cursorY+1:]...)
+	a.markActiveTabDirty()
 	a.cursorY = prevIndex
 	a.cursorX = len([]rune(prev))
 	a.statusMessage = "Merged the current line into the previous line."
@@ -679,6 +725,7 @@ func (a *App) deleteEditor() {
 	if a.cursorX < len(line) {
 		line = append(line[:a.cursorX], line[a.cursorX+1:]...)
 		a.tabs[a.activeTab].Content[a.cursorY] = string(line)
+		a.markActiveTabDirty()
 		a.statusMessage = "Deleted character at cursor."
 		return
 	}
@@ -691,6 +738,7 @@ func (a *App) deleteEditor() {
 	next := a.tabs[a.activeTab].Content[nextIndex]
 	a.tabs[a.activeTab].Content[a.cursorY] = a.tabs[a.activeTab].Content[a.cursorY] + next
 	a.tabs[a.activeTab].Content = append(a.tabs[a.activeTab].Content[:nextIndex], a.tabs[a.activeTab].Content[nextIndex+1:]...)
+	a.markActiveTabDirty()
 	a.statusMessage = "Merged the next line into the current line."
 }
 
@@ -1002,6 +1050,28 @@ func (a *App) saveCurrentFileMemo(input string) (agent.Response, error) {
 	return agent.Response{Mode: agent.ModeMessage, Message: "Saved memo to " + filepath.ToSlash(memoPath)}, nil
 }
 
+func (a *App) saveActiveTab() {
+	current := &a.tabs[a.activeTab]
+	if strings.TrimSpace(current.FilePath) == "" {
+		a.statusMessage = "Current tab is not backed by a file. Open a file path to save changes."
+		return
+	}
+	content := strings.Join(current.Content, "\n")
+	if current.TrailingNewline {
+		content += "\n"
+	}
+	perm := os.FileMode(0o644)
+	if info, err := os.Stat(current.FilePath); err == nil {
+		perm = info.Mode().Perm()
+	}
+	if err := os.WriteFile(current.FilePath, []byte(content), perm); err != nil {
+		a.statusMessage = fmt.Sprintf("Failed to save %s: %v", filepath.ToSlash(current.FilePath), err)
+		return
+	}
+	current.Dirty = false
+	a.statusMessage = "Saved " + filepath.ToSlash(current.FilePath)
+}
+
 func (a *App) resolveMemoContent(input, extracted string) string {
 	trimmed := strings.TrimSpace(input)
 	if (strings.HasPrefix(trimmed, "memo ") || strings.HasPrefix(trimmed, "메모 ")) && strings.TrimSpace(extracted) != "" {
@@ -1056,6 +1126,7 @@ func (a *App) replaceDocument(content string) {
 		lines = []string{""}
 	}
 	a.tabs[a.activeTab].Content = lines
+	a.markActiveTabDirty()
 	a.cursorY = 0
 	a.cursorX = 0
 	a.selectionAnchor = -1
@@ -1252,6 +1323,13 @@ func (a *App) saveCurrentTabState() {
 	tab.CursorY = a.cursorY
 	tab.SelectionAnchorX = a.selectionAnchorX()
 	tab.SelectionAnchorY = a.selectionAnchor
+}
+
+func (a *App) markActiveTabDirty() {
+	if len(a.tabs) == 0 || a.activeTab < 0 || a.activeTab >= len(a.tabs) {
+		return
+	}
+	a.tabs[a.activeTab].Dirty = true
 }
 
 func (a *App) loadCurrentTabState() {
@@ -1513,6 +1591,7 @@ func (a *App) replaceSelection(replacement string) {
 	}
 	newLines = append(newLines, content[end.y+1:]...)
 	a.tabs[a.activeTab].Content = newLines
+	a.markActiveTabDirty()
 	a.clearSelection("Selection replaced.")
 	a.ensureCursorInBounds()
 	if replacement == "" {
@@ -1632,6 +1711,7 @@ func (a *App) moveSelectedBlock(delta int) {
 	}
 
 	a.tabs[a.activeTab].Content = content
+	a.markActiveTabDirty()
 	a.setSelectionAnchor(a.selectionAnchorX(), start)
 	a.cursorY = end
 	a.ensureCursorInBounds()
@@ -1651,6 +1731,7 @@ func (a *App) indentSelection() {
 	for index := start; index <= end; index++ {
 		a.tabs[a.activeTab].Content[index] = a.indentUnit() + a.tabs[a.activeTab].Content[index]
 	}
+	a.markActiveTabDirty()
 	if a.hasSelection() {
 		a.selectionAnchor = start
 		a.cursorY = end
@@ -1668,12 +1749,19 @@ func (a *App) outdentSelection() {
 	start, end := a.activeLineRange()
 
 	removedOnCursor := 0
+	changed := false
 	for index := start; index <= end; index++ {
 		updated, removed := a.removeSingleIndent(a.tabs[a.activeTab].Content[index])
 		a.tabs[a.activeTab].Content[index] = updated
+		if removed > 0 {
+			changed = true
+		}
 		if index == a.cursorY {
 			removedOnCursor = removed
 		}
+	}
+	if changed {
+		a.markActiveTabDirty()
 	}
 	if !a.hasSelection() {
 		a.cursorX -= removedOnCursor
@@ -2130,7 +2218,11 @@ func (a *App) draw() {
 func (a *App) drawTabs(width int) {
 	x := 0
 	for i, tab := range a.tabs {
-		label := "[" + tab.Title + "]"
+		label := "[" + tab.Title
+		if tab.Dirty {
+			label += " ●"
+		}
+		label += "]"
 		style := styleMuted()
 		if i == a.activeTab {
 			style = styleTabActive()
@@ -2164,7 +2256,7 @@ func (a *App) drawEditSurface(x, y, width, height int) {
 		a.drawText(x+1, lineY, styleGutter(), gutter)
 		a.drawTextWithVisibleTabs(x+4, lineY, lineIndex, style, []rune(content[lineIndex]), a.viewportLeft, visibleWidth)
 	}
-	footer := fmt.Sprintf("Focus:%s  Scope:%s  Indent:[Tab/Shift+Tab]  Width:[Alt+0..4]  Tabs:[Alt+,/Alt+. or Ctrl+Tab/Ctrl+Shift+Tab]  Block:[F2/Ctrl+Space/Ctrl+[]  Ctrl+Up/Down:[line or block]  Control:[Ctrl+G]  Quit:[Ctrl+Q]", a.focusLabel(), a.currentScope())
+	footer := fmt.Sprintf("Focus:%s  Scope:%s  Save:[Ctrl+S]  Indent:[Tab/Shift+Tab]  Width:[Alt+0..4]  Tabs:[Alt+,/Alt+. or Ctrl+Tab/Ctrl+Shift+Tab]  Block:[F2/Ctrl+Space/Ctrl+[]  Ctrl+Up/Down:[line or block]  Control:[Ctrl+G]  Quit:[Ctrl+Q]", a.focusLabel(), a.currentScope())
 	if a.helpVisible {
 		footer = fmt.Sprintf("Focus:%s  Scope:%s  Help:[Esc closes]", a.focusLabel(), a.currentScope())
 	}
@@ -2314,6 +2406,7 @@ func (a *App) drawHelpDialog(screenWidth, screenHeight int) {
 		"  Shift/Alt+End    select to line end",
 		"  Shift/Alt+Page   select by larger vertical steps",
 		"  Ctrl+A           select the full editor document",
+		"  Ctrl+S           save the current file-backed tab",
 		"  Ctrl+C / Ctrl+X  copy or cut to system clipboard with internal fallback",
 		"  Ctrl+V           paste from system clipboard or internal fallback",
 		"  Ctrl+Up/Down     swap selected block with adjacent line",
