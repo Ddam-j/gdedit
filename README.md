@@ -3,7 +3,7 @@
 AI 에이전트를 포함한 터미널 cowork editor 프로토타입이다. WezTerm 같은 현대적인 터미널을 권장하지만, 현재 구현은 tmux/ssh 환경도 고려한 보수적인 키맵으로 정리되어 있다.
 
 ## Release Target
-  
+
 - Current release target: `v0.2.0`
 - Core focus: editing-first terminal assistance, per-file Control Hub history, scoped memo routing, and release automation through GitHub Actions + GoReleaser.
 
