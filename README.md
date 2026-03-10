@@ -7,6 +7,12 @@ AI 에이전트를 포함한 터미널 cowork editor 프로토타입이다. WezT
 - Current release target: `v0.2.0`
 - Core focus: editing-first terminal assistance, per-file Control Hub history, scoped memo routing, and release automation through GitHub Actions + GoReleaser.
 
+## Screenshot
+
+![gdedit v0.2.0 screenshot](docs/images/gdedit-v0.2.0-history.png)
+
+The screenshot shows the editing-first layout: active file buffer on the left, Control Hub at the bottom, Status Surface on the right, and per-file conversation history in the `F3` popup.
+
 ## Common Controls
 
 | Area | Keys | Behavior |
