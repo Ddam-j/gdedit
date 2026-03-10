@@ -19,6 +19,22 @@ const (
 
 var userHomeDir = os.UserHomeDir
 
+type Scope string
+
+const (
+	ScopeProject Scope = "project"
+	ScopeApp     Scope = "app"
+	ScopeSystem  Scope = "system"
+)
+
+type Target struct {
+	Scope    Scope
+	Name     string
+	Dir      string
+	FileName string
+	Path     string
+}
+
 func LoadContext(systemRoot, workspace string) (string, error) {
 	sections := []string{}
 
@@ -132,54 +148,88 @@ func DebugRoots(systemRoot, workspace string) string {
 }
 
 func SaveFileMemo(systemRoot, workspace, filePath, note string) (string, error) {
-	if strings.TrimSpace(filePath) == "" {
-		return "", fmt.Errorf("file path is empty")
-	}
-	if strings.TrimSpace(note) == "" {
-		return "", fmt.Errorf("memo note is empty")
-	}
-
-	memoDir, memoName, err := resolveMemoTarget(systemRoot, workspace, filePath)
+	target, err := SaveFileMemoDetailed(systemRoot, workspace, filePath, note)
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(memoDir, 0o755); err != nil {
-		return "", err
+	return target.Path, nil
+}
+
+func SaveFileMemoDetailed(systemRoot, workspace, filePath, note string) (Target, error) {
+	if strings.TrimSpace(filePath) == "" {
+		return Target{}, fmt.Errorf("file path is empty")
 	}
-	memoPath := filepath.Join(memoDir, memoName)
+	if strings.TrimSpace(note) == "" {
+		return Target{}, fmt.Errorf("memo note is empty")
+	}
+
+	target, err := resolveMemoTarget(systemRoot, workspace, filePath)
+	if err != nil {
+		return Target{}, err
+	}
+	if err := os.MkdirAll(target.Dir, 0o755); err != nil {
+		return Target{}, err
+	}
+	memoPath := filepath.Join(target.Dir, target.FileName)
 	entry := buildMemoEntry(filePath, note)
 
 	f, err := os.OpenFile(memoPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return "", err
+		return Target{}, err
 	}
 	defer f.Close()
 	if _, err := f.WriteString(entry); err != nil {
-		return "", err
+		return Target{}, err
 	}
-	return memoPath, nil
+	target.Path = memoPath
+	return target, nil
 }
 
-func resolveMemoTarget(systemRoot, workspace, filePath string) (string, string, error) {
+func resolveMemoTarget(systemRoot, workspace, filePath string) (Target, error) {
 	cleanFilePath := filepath.Clean(filePath)
-	if isProjectFile(workspace, cleanFilePath) {
+	projectMatch := isProjectFile(workspace, cleanFilePath)
+	if isAppConfigFile(cleanFilePath) && (!projectMatch || appScopeOverridesProject(workspace, cleanFilePath)) {
+		if strings.TrimSpace(systemRoot) == "" {
+			return Target{}, fmt.Errorf("system memo root is empty")
+		}
+		name := appMemoName(cleanFilePath)
+		return Target{Scope: ScopeApp, Name: name, Dir: filepath.Join(systemRoot, "app"), FileName: name + ".md"}, nil
+	}
+	if projectMatch {
 		memoDir := filepath.Join(workspace, projectDirName, "memos")
 		relPath := cleanFilePath
 		if rel, err := filepath.Rel(workspace, cleanFilePath); err == nil && !strings.HasPrefix(rel, "..") {
 			relPath = rel
 		}
-		return memoDir, sanitizeMemoName(relPath) + ".md", nil
+		return Target{Scope: ScopeProject, Name: sanitizeMemoName(relPath), Dir: memoDir, FileName: sanitizeMemoName(relPath) + ".md"}, nil
 	}
-	if isAppConfigFile(cleanFilePath) {
-		if strings.TrimSpace(systemRoot) == "" {
-			return "", "", fmt.Errorf("system memo root is empty")
-		}
-		return filepath.Join(systemRoot, "app"), appMemoName(cleanFilePath) + ".md", nil
+	if strings.TrimSpace(systemRoot) == "" {
+		return Target{}, fmt.Errorf("system memo root is empty")
 	}
+	name := systemMemoName(cleanFilePath)
+	return Target{Scope: ScopeSystem, Name: name, Dir: filepath.Join(systemRoot, "system"), FileName: name + ".md"}, nil
+}
+
+func appScopeOverridesProject(workspace, filePath string) bool {
 	if strings.TrimSpace(workspace) == "" {
-		return "", "", fmt.Errorf("workspace is empty")
+		return false
 	}
-	return filepath.Join(workspace, projectDirName, "memos"), sanitizeMemoName(filepath.Base(cleanFilePath)) + ".md", nil
+	home, err := userHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return false
+	}
+	workspace = filepath.Clean(workspace)
+	home = filepath.Clean(home)
+	if samePath(workspace, home) {
+		return true
+	}
+	configRoot := filepath.Join(home, ".config")
+	appDataRoot := filepath.Join(home, "AppData")
+	return samePath(workspace, configRoot) || samePath(workspace, appDataRoot)
+}
+
+func samePath(a, b string) bool {
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
 }
 
 func isProjectFile(workspace, filePath string) bool {
@@ -219,6 +269,37 @@ func isAppConfigFile(filePath string) bool {
 }
 
 func appMemoName(filePath string) string {
+	home, err := userHomeDir()
+	if err == nil && strings.TrimSpace(home) != "" {
+		if name := appMemoNameFromHomePath(home, filePath); name != "" {
+			return name
+		}
+	}
+	return appMemoNameFromBase(filePath)
+}
+
+func appMemoNameFromHomePath(home, filePath string) string {
+	rel, err := filepath.Rel(home, filePath)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for i, part := range parts {
+		switch part {
+		case ".config":
+			if i+1 < len(parts) {
+				return sanitizeMemoName(parts[i+1])
+			}
+		case "AppData":
+			if i+2 < len(parts) {
+				return sanitizeMemoName(parts[i+2])
+			}
+		}
+	}
+	return ""
+}
+
+func appMemoNameFromBase(filePath string) string {
 	base := strings.TrimSpace(filepath.Base(filePath))
 	base = strings.TrimPrefix(base, ".")
 	for {
@@ -233,6 +314,23 @@ func appMemoName(filePath string) string {
 		return "app"
 	}
 	return sanitizeMemoName(base)
+}
+
+func systemMemoName(filePath string) string {
+	clean := strings.TrimSpace(filepath.Base(filePath))
+	for {
+		ext := filepath.Ext(clean)
+		if ext == "" {
+			break
+		}
+		clean = strings.TrimSuffix(clean, ext)
+	}
+	clean = strings.TrimPrefix(clean, ".")
+	clean = strings.TrimSpace(clean)
+	if clean == "" {
+		return "system"
+	}
+	return sanitizeMemoName(clean)
 }
 
 func sanitizeMemoName(path string) string {
@@ -270,13 +368,31 @@ func memoSegments(note string) []string {
 	lines := strings.Split(trimmed, "\n")
 	segments := []string{}
 	for _, line := range lines {
-		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "-"), "*"))
-		if line == "" {
-			continue
+		for _, part := range splitExplicitMemoLine(line) {
+			part = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(part, "-"), "*"))
+			if part == "" {
+				continue
+			}
+			segments = append(segments, splitSentenceLike(part)...)
 		}
-		segments = append(segments, splitSentenceLike(line)...)
 	}
 	return compactSegments(segments)
+}
+
+func splitExplicitMemoLine(line string) []string {
+	parts := strings.Split(line, "-.")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		result = append(result, part)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func splitSentenceLike(text string) []string {

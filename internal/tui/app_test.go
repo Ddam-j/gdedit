@@ -55,6 +55,133 @@ func TestCtrlQOpensQuitConfirmation(t *testing.T) {
 	}
 }
 
+func TestHelpScrollsWithUpDownAndResetsOnClose(t *testing.T) {
+	app := New()
+
+	quit := app.handleKey(tcell.NewEventKey(tcell.KeyF1, 0, 0))
+	if quit {
+		t.Fatal("did not expect F1 to quit")
+	}
+	if !app.helpVisible {
+		t.Fatal("expected help to become visible")
+	}
+	if app.helpScroll != 0 {
+		t.Fatalf("expected help scroll to start at 0, got %d", app.helpScroll)
+	}
+
+	quit = app.handleKey(tcell.NewEventKey(tcell.KeyDown, 0, 0))
+	if quit {
+		t.Fatal("did not expect Down in help to quit")
+	}
+	if app.helpScroll != 1 {
+		t.Fatalf("expected help scroll to advance to 1, got %d", app.helpScroll)
+	}
+
+	quit = app.handleKey(tcell.NewEventKey(tcell.KeyUp, 0, 0))
+	if quit {
+		t.Fatal("did not expect Up in help to quit")
+	}
+	if app.helpScroll != 0 {
+		t.Fatalf("expected help scroll to return to 0, got %d", app.helpScroll)
+	}
+
+	for range 200 {
+		_ = app.handleKey(tcell.NewEventKey(tcell.KeyDown, 0, 0))
+	}
+	if app.helpScroll != app.maxHelpScroll() {
+		t.Fatalf("expected help scroll to clamp at %d, got %d", app.maxHelpScroll(), app.helpScroll)
+	}
+
+	quit = app.handleKey(tcell.NewEventKey(tcell.KeyEsc, 0, 0))
+	if quit {
+		t.Fatal("did not expect Esc in help to quit")
+	}
+	if app.helpVisible {
+		t.Fatal("expected help to close on Esc")
+	}
+	if app.helpScroll != 0 {
+		t.Fatalf("expected help scroll reset to 0 after close, got %d", app.helpScroll)
+	}
+}
+
+func TestHistoryDialogOpensAndClosesWithF3AndEsc(t *testing.T) {
+	app := New()
+	quit := app.handleKey(tcell.NewEventKey(tcell.KeyF3, 0, 0))
+	if quit {
+		t.Fatal("did not expect F3 to quit")
+	}
+	if !app.historyVisible {
+		t.Fatal("expected history dialog to become visible")
+	}
+	quit = app.handleKey(tcell.NewEventKey(tcell.KeyEsc, 0, 0))
+	if quit {
+		t.Fatal("did not expect Esc in history to quit")
+	}
+	if app.historyVisible {
+		t.Fatal("expected history dialog to close")
+	}
+}
+
+func TestAgentReplyAndHistoryAreScopedPerTab(t *testing.T) {
+	app := New()
+	app.activeTab = 0
+	app.preview = Preview{Kind: CommandTalk, Pending: true, Action: "talk with edit agent", Tab: app.tabs[0].Title}
+	app.executingControlInput = "hello main"
+	app.completeControlExecution(agent.Response{Mode: agent.ModeMessage, Message: "reply for main"})
+	if len(app.tabs[0].History) != 1 {
+		t.Fatalf("expected first tab history length 1, got %d", len(app.tabs[0].History))
+	}
+	if app.tabs[0].History[0].Prompt != "hello main" {
+		t.Fatalf("unexpected first tab history prompt: %q", app.tabs[0].History[0].Prompt)
+	}
+
+	app.nextTab()
+	if got := app.lastAgentReply; got != "" {
+		t.Fatalf("expected second tab to have empty last reply, got %q", got)
+	}
+	if len(app.tabs[app.activeTab].History) != 0 {
+		t.Fatalf("expected second tab history to be empty, got %d", len(app.tabs[app.activeTab].History))
+	}
+	if got := strings.Join(app.historyLines(), "\n"); !strings.Contains(got, "(no conversation history for this tab yet)") {
+		t.Fatalf("expected empty-history lines for second tab, got %q", got)
+	}
+
+	app.prevTab()
+	if got := app.lastAgentReply; got != "reply for main" {
+		t.Fatalf("expected first tab reply to restore, got %q", got)
+	}
+	if len(app.tabs[app.activeTab].History) != 1 {
+		t.Fatalf("expected first tab history to restore, got %d", len(app.tabs[app.activeTab].History))
+	}
+	if got := strings.Join(app.historyLines(), "\n"); !strings.Contains(got, "hello main") || !strings.Contains(got, "reply for main") {
+		t.Fatalf("expected first tab history lines to restore, got %q", got)
+	}
+}
+
+func TestEllipsizeRunesAddsTrailingDots(t *testing.T) {
+	got := ellipsizeRunes("this reply is too long", 10)
+	if got != "this re..." {
+		t.Fatalf("unexpected ellipsized text: %q", got)
+	}
+}
+
+func TestHistoryLinesForWidthWrapsKoreanWithoutOverflow(t *testing.T) {
+	app := New()
+	app.tabs[app.activeTab].History = []historyEntry{{
+		Prompt: "메모를 읽어서 장점을 말해줘",
+		Reply:  "메모와 현재 설정을 보면 장점은 분명합니다. 여러 배경 이미지와 배경 전환 단축키가 설정되어 있습니다.",
+	}}
+	lines := app.historyLinesForWidth(24)
+	if len(lines) < 4 {
+		t.Fatalf("expected wrapped history lines, got %#v", lines)
+	}
+	for _, line := range lines {
+		if visualWidthString(line) > 24 {
+			t.Fatalf("history line exceeds target width: %q (width=%d)", line, visualWidthString(line))
+		}
+	}
+}
+
 func TestNewIncludesRepresentativeSampleTabs(t *testing.T) {
 	app := New()
 	want := []string{"main.go", "worker.py", "panel.ts", "config.yaml"}
@@ -725,6 +852,76 @@ func TestBacktabOutdentsSelectedRange(t *testing.T) {
 	}
 }
 
+func TestTabIndentSelectionMovesSelectionColumnsWithContent(t *testing.T) {
+	app := New()
+	app.activeTab = 3
+	app.tabs[app.activeTab] = Tab{
+		Title:            "flat.txt",
+		Content:          []string{"alpha", "beta", "gamma"},
+		Locked:           map[int]bool{},
+		SelectionAnchorY: -1,
+	}
+	app.loadCurrentTabState()
+	app.setSelectionAnchor(1, 0)
+	app.cursorY = 1
+	app.cursorX = 2
+
+	quit := app.handleEditorKey(tcell.NewEventKey(tcell.KeyTab, 0, 0))
+	if quit {
+		t.Fatal("did not expect Tab to quit")
+	}
+	if got := app.tabs[app.activeTab].Content[0]; got != "  alpha" {
+		t.Fatalf("unexpected first indented line: %q", got)
+	}
+	if got := app.tabs[app.activeTab].Content[1]; got != "  beta" {
+		t.Fatalf("unexpected second indented line: %q", got)
+	}
+	if app.selectionAnchorCol != 3 {
+		t.Fatalf("expected anchor column to move to 3, got %d", app.selectionAnchorCol)
+	}
+	if app.cursorX != 4 {
+		t.Fatalf("expected cursor column to move to 4, got %d", app.cursorX)
+	}
+	if got := app.selectedText(); got != "lpha\n  be" {
+		t.Fatalf("unexpected selected text after indent: %q", got)
+	}
+}
+
+func TestShiftTabOutdentSelectionMovesSelectionColumnsWithContent(t *testing.T) {
+	app := New()
+	app.activeTab = 3
+	app.tabs[app.activeTab] = Tab{
+		Title:            "flat.txt",
+		Content:          []string{"  alpha", "  beta", "gamma"},
+		Locked:           map[int]bool{},
+		SelectionAnchorY: -1,
+	}
+	app.loadCurrentTabState()
+	app.setSelectionAnchor(3, 0)
+	app.cursorY = 1
+	app.cursorX = 4
+
+	quit := app.handleEditorKey(tcell.NewEventKey(tcell.KeyBacktab, 0, 0))
+	if quit {
+		t.Fatal("did not expect Shift+Tab to quit")
+	}
+	if got := app.tabs[app.activeTab].Content[0]; got != "alpha" {
+		t.Fatalf("unexpected first outdented line: %q", got)
+	}
+	if got := app.tabs[app.activeTab].Content[1]; got != "beta" {
+		t.Fatalf("unexpected second outdented line: %q", got)
+	}
+	if app.selectionAnchorCol != 1 {
+		t.Fatalf("expected anchor column to move to 1, got %d", app.selectionAnchorCol)
+	}
+	if app.cursorX != 2 {
+		t.Fatalf("expected cursor column to move to 2, got %d", app.cursorX)
+	}
+	if got := app.selectedText(); got != "lpha\nbe" {
+		t.Fatalf("unexpected selected text after outdent: %q", got)
+	}
+}
+
 func TestStyleTabGlyphDiffersFromNormalText(t *testing.T) {
 	if styleTabGlyph() == styleNormal() {
 		t.Fatal("expected literal tab glyph style to differ from normal text")
@@ -919,6 +1116,45 @@ func TestAltCommaAndAltDotNavigateTabs(t *testing.T) {
 	}
 	if app.activeTab != 0 {
 		t.Fatalf("expected active tab 0 after Alt+,, got %d", app.activeTab)
+	}
+}
+
+func TestAltCommaAndAltDotNavigateTabsFromControlHub(t *testing.T) {
+	app := New()
+	app.focus = focusControl
+
+	quit := app.handleKey(tcell.NewEventKey(tcell.KeyRune, '.', tcell.ModAlt))
+	if quit {
+		t.Fatal("did not expect Alt+. in control hub to quit")
+	}
+	if app.activeTab != 1 {
+		t.Fatalf("expected active tab 1 after Alt+. in control hub, got %d", app.activeTab)
+	}
+
+	quit = app.handleKey(tcell.NewEventKey(tcell.KeyRune, ',', tcell.ModAlt))
+	if quit {
+		t.Fatal("did not expect Alt+, in control hub to quit")
+	}
+	if app.activeTab != 0 {
+		t.Fatalf("expected active tab 0 after Alt+, in control hub, got %d", app.activeTab)
+	}
+}
+
+func TestControlHubIgnoresUnhandledAltModifiedRunes(t *testing.T) {
+	app := New()
+	app.focus = focusControl
+	app.controlInput = []rune("inspect")
+	app.controlCursor = len(app.controlInput)
+
+	quit := app.handleControlKey(tcell.NewEventKey(tcell.KeyRune, 'x', tcell.ModAlt))
+	if quit {
+		t.Fatal("did not expect Alt-modified control input to quit")
+	}
+	if got := string(app.controlInput); got != "inspect" {
+		t.Fatalf("expected control input to remain unchanged, got %q", got)
+	}
+	if got := app.statusMessage; got != "Unhandled Alt-modified control key was ignored." {
+		t.Fatalf("unexpected status message: %q", got)
 	}
 }
 
@@ -1138,6 +1374,106 @@ func TestControlHubSelectionShortcuts(t *testing.T) {
 			}
 		},
 	)
+}
+
+func TestControlHubDeleteRemovesSelectedText(t *testing.T) {
+	app := New()
+	app.focus = focusControl
+	app.controlInput = []rune("inspect")
+	app.controlCursor = 7
+	app.controlSelectAnchor = 2
+
+	quit := app.handleControlKey(tcell.NewEventKey(tcell.KeyDelete, 0, 0))
+	if quit {
+		t.Fatal("did not expect Delete in control hub to quit")
+	}
+	if got := string(app.controlInput); got != "in" {
+		t.Fatalf("unexpected control input after Delete: %q", got)
+	}
+	if app.hasControlSelection() {
+		t.Fatal("expected control selection to clear after Delete")
+	}
+}
+
+func TestControlHubCtrlRightMovesByWord(t *testing.T) {
+	app := New()
+	app.focus = focusControl
+	app.controlInput = []rune("open file_name now")
+
+	quit := app.handleControlKey(tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModCtrl))
+	if quit {
+		t.Fatal("did not expect Ctrl+Right in control hub to quit")
+	}
+	if app.controlCursor != 5 {
+		t.Fatalf("expected control cursor at 5 after first word jump, got %d", app.controlCursor)
+	}
+
+	quit = app.handleControlKey(tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModCtrl))
+	if quit {
+		t.Fatal("did not expect second Ctrl+Right in control hub to quit")
+	}
+	if app.controlCursor != 15 {
+		t.Fatalf("expected control cursor at 15 after second word jump, got %d", app.controlCursor)
+	}
+}
+
+func TestControlHubCtrlLeftMovesByWord(t *testing.T) {
+	app := New()
+	app.focus = focusControl
+	app.controlInput = []rune("open file_name now")
+	app.controlCursor = len(app.controlInput)
+
+	quit := app.handleControlKey(tcell.NewEventKey(tcell.KeyLeft, 0, tcell.ModCtrl))
+	if quit {
+		t.Fatal("did not expect Ctrl+Left in control hub to quit")
+	}
+	if app.controlCursor != 15 {
+		t.Fatalf("expected control cursor at 15 after first backward word jump, got %d", app.controlCursor)
+	}
+
+	quit = app.handleControlKey(tcell.NewEventKey(tcell.KeyLeft, 0, tcell.ModCtrl))
+	if quit {
+		t.Fatal("did not expect second Ctrl+Left in control hub to quit")
+	}
+	if app.controlCursor != 5 {
+		t.Fatalf("expected control cursor at 5 after second backward word jump, got %d", app.controlCursor)
+	}
+}
+
+func TestControlHubCtrlAltRightSelectsByWord(t *testing.T) {
+	app := New()
+	app.focus = focusControl
+	app.controlInput = []rune("open file_name now")
+	app.controlCursor = 5
+
+	quit := app.handleControlKey(tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModCtrl|tcell.ModAlt))
+	if quit {
+		t.Fatal("did not expect Ctrl+Alt+Right in control hub to quit")
+	}
+	if !app.hasControlSelection() {
+		t.Fatal("expected Ctrl+Alt+Right to create a control selection")
+	}
+	if got := app.selectedControlText(); got != "file_name " {
+		t.Fatalf("unexpected control selection after Ctrl+Alt+Right: %q", got)
+	}
+}
+
+func TestControlHubCtrlAltLeftSelectsByWord(t *testing.T) {
+	app := New()
+	app.focus = focusControl
+	app.controlInput = []rune("open file_name now")
+	app.controlCursor = len(app.controlInput)
+
+	quit := app.handleControlKey(tcell.NewEventKey(tcell.KeyLeft, 0, tcell.ModCtrl|tcell.ModAlt))
+	if quit {
+		t.Fatal("did not expect Ctrl+Alt+Left in control hub to quit")
+	}
+	if !app.hasControlSelection() {
+		t.Fatal("expected Ctrl+Alt+Left to create a control selection")
+	}
+	if got := app.selectedControlText(); got != "now" {
+		t.Fatalf("unexpected control selection after Ctrl+Alt+Left: %q", got)
+	}
 }
 
 func TestCtrlLeftBracketSelectsCurrentAndParentBlock(t *testing.T) {
@@ -1428,6 +1764,168 @@ func TestControlHubInspectExecutesOnFirstEnter(t *testing.T) {
 	}
 }
 
+func TestControlHubOpenExecutesOnFirstEnter(t *testing.T) {
+	workspace := t.TempDir()
+	filePath := workspace + string(os.PathSeparator) + "note.txt"
+	if err := os.WriteFile(filePath, []byte("hello\n"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	app := NewScratchWithAgent("", nil, workspace, "")
+	app.focus = focusControl
+	app.controlInput = []rune("/open " + filePath)
+	app.controlCursor = len(app.controlInput)
+
+	quit := app.handleControlKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+	if quit {
+		t.Fatal("did not expect /open to quit")
+	}
+	if app.preview.Pending {
+		t.Fatal("did not expect /open to remain in preview")
+	}
+	if len(app.tabs) != 2 {
+		t.Fatalf("expected second tab to be opened, got %d tabs", len(app.tabs))
+	}
+	if app.activeTab != 1 {
+		t.Fatalf("expected new tab to become active, got %d", app.activeTab)
+	}
+	if app.tabs[app.activeTab].Title != "note.txt" {
+		t.Fatalf("unexpected open tab title: %q", app.tabs[app.activeTab].Title)
+	}
+	if got := app.statusMessage; !strings.Contains(got, "Opened") {
+		t.Fatalf("unexpected status message: %q", got)
+	}
+	if app.voiceState != "ready" {
+		t.Fatalf("expected voice state ready after /open, got %q", app.voiceState)
+	}
+}
+
+func TestControlHubOpenSwitchesToExistingTab(t *testing.T) {
+	workspace := t.TempDir()
+	filePath := workspace + string(os.PathSeparator) + "note.txt"
+	if err := os.WriteFile(filePath, []byte("hello\n"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	app, err := NewWithFiles("", nil, workspace, "", []string{filePath})
+	if err != nil {
+		t.Fatalf("new with files: %v", err)
+	}
+	app.tabs = append(app.tabs, scratchTab())
+	app.activeTab = 1
+	app.focus = focusControl
+	app.controlInput = []rune("/open " + filePath)
+	app.controlCursor = len(app.controlInput)
+
+	_ = app.handleControlKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+
+	if app.activeTab != 0 {
+		t.Fatalf("expected existing file tab to become active, got %d", app.activeTab)
+	}
+	if got := app.statusMessage; !strings.Contains(got, "Switched to") {
+		t.Fatalf("unexpected switch status: %q", got)
+	}
+}
+
+func TestControlHubOpenCanCreateMissingFileBackedTab(t *testing.T) {
+	workspace := t.TempDir()
+	filePath := workspace + string(os.PathSeparator) + "missing.txt"
+
+	app := NewScratchWithAgent("", nil, workspace, "")
+	app.focus = focusControl
+	app.controlInput = []rune("/open " + filePath)
+	app.controlCursor = len(app.controlInput)
+
+	_ = app.handleControlKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+
+	if app.tabs[app.activeTab].FilePath != filePath {
+		t.Fatalf("unexpected opened file path: %q", app.tabs[app.activeTab].FilePath)
+	}
+	if len(app.tabs[app.activeTab].Content) != 1 || app.tabs[app.activeTab].Content[0] != "" {
+		t.Fatalf("unexpected missing-file tab content: %#v", app.tabs[app.activeTab].Content)
+	}
+}
+
+func TestControlHubWriteExecutesOnFirstEnter(t *testing.T) {
+	workspace := t.TempDir()
+	targetPath := workspace + string(os.PathSeparator) + "saved.txt"
+
+	app := NewScratchWithAgent("", nil, workspace, "")
+	app.insertRune('a')
+	app.focus = focusControl
+	app.controlInput = []rune("/write " + targetPath)
+	app.controlCursor = len(app.controlInput)
+
+	quit := app.handleControlKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+	if quit {
+		t.Fatal("did not expect /write to quit")
+	}
+	if app.preview.Pending {
+		t.Fatal("did not expect /write to remain in preview")
+	}
+	content, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("read written file: %v", err)
+	}
+	if string(content) != "a" {
+		t.Fatalf("unexpected written content: %q", string(content))
+	}
+	if app.tabs[app.activeTab].FilePath != targetPath {
+		t.Fatalf("expected tab file path to update, got %q", app.tabs[app.activeTab].FilePath)
+	}
+	if app.tabs[app.activeTab].Title != "saved.txt" {
+		t.Fatalf("expected tab title to update, got %q", app.tabs[app.activeTab].Title)
+	}
+	if app.tabs[app.activeTab].Dirty {
+		t.Fatal("expected dirty state to clear after /write")
+	}
+	if got := app.statusMessage; !strings.Contains(got, "Saved") {
+		t.Fatalf("unexpected status message: %q", got)
+	}
+}
+
+func TestControlHubWriteSupportsQuotedPath(t *testing.T) {
+	workspace := t.TempDir()
+	targetPath := workspace + string(os.PathSeparator) + "file with spaces.txt"
+
+	app := NewScratchWithAgent("", nil, workspace, "")
+	app.insertRune('x')
+	app.focus = focusControl
+	app.controlInput = []rune(`/saveas "` + targetPath + `"`)
+	app.controlCursor = len(app.controlInput)
+
+	_ = app.handleControlKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+
+	content, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("read quoted-path file: %v", err)
+	}
+	if string(content) != "x" {
+		t.Fatalf("unexpected quoted-path content: %q", string(content))
+	}
+}
+
+func TestControlHubWriteCreatesMissingParentDirectories(t *testing.T) {
+	workspace := t.TempDir()
+	targetPath := workspace + string(os.PathSeparator) + "nested" + string(os.PathSeparator) + "dir" + string(os.PathSeparator) + "saved.txt"
+
+	app := NewScratchWithAgent("", nil, workspace, "")
+	app.insertRune('z')
+	app.focus = focusControl
+	app.controlInput = []rune("/write " + targetPath)
+	app.controlCursor = len(app.controlInput)
+
+	_ = app.handleControlKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+
+	content, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("read nested written file: %v", err)
+	}
+	if string(content) != "z" {
+		t.Fatalf("unexpected nested written content: %q", string(content))
+	}
+}
+
 func TestTypingAfterReplyClearsStaleAgentReply(t *testing.T) {
 	app := New()
 	app.focus = focusControl
@@ -1620,7 +2118,7 @@ func TestControlHubMemoCommandSavesCurrentFileMemo(t *testing.T) {
 	_ = app.handleControlKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
 	_ = app.handleControlKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
 
-	if !strings.Contains(app.statusMessage, "Saved memo to") {
+	if !strings.Contains(app.statusMessage, "Saved project(config.yaml) memo to") {
 		t.Fatalf("unexpected status message: %q", app.statusMessage)
 	}
 	contextText, err := memo.LoadContext("", workspace)
@@ -1670,5 +2168,55 @@ func TestExtractMemoNoteFallsBackToNaturalLanguageMemoRequest(t *testing.T) {
 	input := "설정 내용을 메모해줘 메모파일은 앱의 이름으로"
 	if got := extractMemoNote(input); got != input {
 		t.Fatalf("unexpected memo note extraction: %q", got)
+	}
+}
+
+func TestResolveMemoContentDoesNotUseLastAgentResultForNonMemoRequest(t *testing.T) {
+	app := New()
+	app.lastAgentResult = "stale previous agent explanation"
+	input := "explain this config"
+	got := app.resolveMemoContent(input, extractMemoNote(input))
+	if got != "" {
+		t.Fatalf("expected non-memo request not to reuse last agent result, got %q", got)
+	}
+}
+
+func TestResolveMemoContentPrefersExplicitArrowPayload(t *testing.T) {
+	app := New()
+	app.lastAgentResult = "stale previous agent explanation"
+	input := "그러면 메모를 추가해줘 -> -.test"
+	got := app.resolveMemoContent(input, extractMemoNote(input))
+	if got != "-.test" {
+		t.Fatalf("expected explicit memo payload, got %q", got)
+	}
+}
+
+func TestMemoExecutionDoesNotOverwriteLastAgentResult(t *testing.T) {
+	workspace := t.TempDir()
+	filePath := workspace + string(os.PathSeparator) + "config.yaml"
+	if err := os.WriteFile(filePath, []byte("mode: safe\n"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	app, err := NewWithFiles("", nil, workspace, "", []string{filePath})
+	if err != nil {
+		t.Fatalf("new with files: %v", err)
+	}
+	app.lastAgentResult = "previous useful agent explanation"
+	app.focus = focusControl
+	app.controlInput = []rune("그러면 메모를 추가해줘 -> -.test")
+	app.controlCursor = len(app.controlInput)
+
+	_ = app.handleControlKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+	_ = app.handleControlKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+
+	if app.lastAgentResult != "previous useful agent explanation" {
+		t.Fatalf("expected memo execution not to overwrite lastAgentResult, got %q", app.lastAgentResult)
+	}
+	contextText, err := memo.LoadContext("", workspace)
+	if err != nil {
+		t.Fatalf("load context: %v", err)
+	}
+	if !strings.Contains(contextText, "- test") {
+		t.Fatalf("missing explicit memo payload in saved context: %s", contextText)
 	}
 }

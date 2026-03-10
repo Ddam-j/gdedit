@@ -57,6 +57,9 @@ type Tab struct {
 	Content          []string
 	TrailingNewline  bool
 	Dirty            bool
+	LastAgentReply   string
+	LastAgentResult  string
+	History          []historyEntry
 	Locked           map[int]bool
 	ViewTop          int
 	ViewLeft         int
@@ -71,46 +74,55 @@ type lineRange struct {
 	end   int
 }
 
+type historyEntry struct {
+	Prompt string
+	Reply  string
+}
+
 type textPos struct {
 	x int
 	y int
 }
 
 type App struct {
-	screen               tcell.Screen
-	tabs                 []Tab
-	activeTab            int
-	focus                focusArea
-	controlInput         []rune
-	controlCursor        int
-	controlSelectAnchor  int
-	controlViewportLeft  int
-	controlViewportWidth int
-	preview              Preview
-	cursorX              int
-	cursorY              int
-	selectionAnchorCol   int
-	selectionAnchor      int
-	statusMessage        string
-	lastAgentReply       string
-	lastAgentResult      string
-	voiceState           string
-	lastCommand          string
-	helpVisible          bool
-	quitConfirm          bool
-	indentWidth          int
-	clipboard            string
-	agentProfile         string
-	agentExecutor        agent.Executor
-	workspaceRoot        string
-	systemMemoRoot       string
-	agentRunning         bool
-	spinnerIndex         int
-	spinnerStop          chan struct{}
-	viewportTop          int
-	editorViewportHeight int
-	viewportLeft         int
-	editorViewportWidth  int
+	screen                tcell.Screen
+	tabs                  []Tab
+	activeTab             int
+	focus                 focusArea
+	controlInput          []rune
+	controlCursor         int
+	controlSelectAnchor   int
+	controlViewportLeft   int
+	controlViewportWidth  int
+	preview               Preview
+	cursorX               int
+	cursorY               int
+	selectionAnchorCol    int
+	selectionAnchor       int
+	statusMessage         string
+	lastAgentReply        string
+	lastAgentResult       string
+	executingControlInput string
+	voiceState            string
+	lastCommand           string
+	helpVisible           bool
+	helpScroll            int
+	historyVisible        bool
+	historyScroll         int
+	quitConfirm           bool
+	indentWidth           int
+	clipboard             string
+	agentProfile          string
+	agentExecutor         agent.Executor
+	workspaceRoot         string
+	systemMemoRoot        string
+	agentRunning          bool
+	spinnerIndex          int
+	spinnerStop           chan struct{}
+	viewportTop           int
+	editorViewportHeight  int
+	viewportLeft          int
+	editorViewportWidth   int
 }
 
 func New() *App {
@@ -333,9 +345,31 @@ func (a *App) handleKey(ev *tcell.EventKey) bool {
 
 	if ev.Key() == tcell.KeyF1 {
 		a.helpVisible = true
+		a.helpScroll = 0
+		a.historyVisible = false
 		a.quitConfirm = false
 		a.statusMessage = "Help opened. Press Esc to close."
 		return false
+	}
+
+	if ev.Key() == tcell.KeyF3 {
+		a.historyVisible = true
+		a.historyScroll = 0
+		a.helpVisible = false
+		a.quitConfirm = false
+		a.statusMessage = "History opened. Press Esc to close."
+		return false
+	}
+
+	if ev.Key() == tcell.KeyRune && ev.Modifiers()&tcell.ModAlt != 0 {
+		switch ev.Rune() {
+		case '.':
+			a.nextTab()
+			return false
+		case ',':
+			a.prevTab()
+			return false
+		}
 	}
 
 	if a.quitConfirm {
@@ -360,9 +394,42 @@ func (a *App) handleKey(ev *tcell.EventKey) bool {
 	}
 
 	if a.helpVisible {
-		if ev.Key() == tcell.KeyEsc {
+		switch ev.Key() {
+		case tcell.KeyEsc:
 			a.helpVisible = false
+			a.helpScroll = 0
 			a.statusMessage = "Help closed."
+			return false
+		case tcell.KeyUp:
+			if a.helpScroll > 0 {
+				a.helpScroll--
+			}
+			return false
+		case tcell.KeyDown:
+			if a.helpScroll < a.maxHelpScroll() {
+				a.helpScroll++
+			}
+			return false
+		}
+		return false
+	}
+
+	if a.historyVisible {
+		switch ev.Key() {
+		case tcell.KeyEsc:
+			a.historyVisible = false
+			a.historyScroll = 0
+			a.statusMessage = "History closed."
+			return false
+		case tcell.KeyUp:
+			if a.historyScroll > 0 {
+				a.historyScroll--
+			}
+			return false
+		case tcell.KeyDown:
+			if a.historyScroll < a.maxHistoryScroll() {
+				a.historyScroll++
+			}
 			return false
 		}
 		return false
@@ -842,7 +909,27 @@ func (a *App) handleControlKey(ev *tcell.EventKey) bool {
 			a.preview = Preview{}
 		}
 		return false
+	case tcell.KeyDelete:
+		if a.hasControlSelection() {
+			a.replaceControlSelection("")
+			return false
+		}
+		if a.controlCursor < len(a.controlInput) {
+			a.clearLastAgentReply()
+			a.controlInput = append(a.controlInput[:a.controlCursor], a.controlInput[a.controlCursor+1:]...)
+			a.ensureControlCursorInBounds()
+			a.preview = Preview{}
+		}
+		return false
 	case tcell.KeyLeft:
+		if hasWordSelectionModifier(ev.Modifiers()) {
+			a.moveControlWord(-1, true)
+			return false
+		}
+		if hasWordMoveModifier(ev.Modifiers()) {
+			a.moveControlWord(-1, false)
+			return false
+		}
 		if hasSelectionModifier(ev.Modifiers()) {
 			a.moveControlCursor(-1, true)
 			return false
@@ -854,6 +941,14 @@ func (a *App) handleControlKey(ev *tcell.EventKey) bool {
 		a.ensureControlCursorInBounds()
 		return false
 	case tcell.KeyRight:
+		if hasWordSelectionModifier(ev.Modifiers()) {
+			a.moveControlWord(1, true)
+			return false
+		}
+		if hasWordMoveModifier(ev.Modifiers()) {
+			a.moveControlWord(1, false)
+			return false
+		}
 		if hasSelectionModifier(ev.Modifiers()) {
 			a.moveControlCursor(1, true)
 			return false
@@ -871,6 +966,10 @@ func (a *App) handleControlKey(ev *tcell.EventKey) bool {
 		a.moveControlBoundary(false, hasSelectionModifier(ev.Modifiers()))
 		return false
 	case tcell.KeyRune:
+		if ev.Modifiers()&tcell.ModAlt != 0 {
+			a.statusMessage = "Unhandled Alt-modified control key was ignored."
+			return false
+		}
 		r := ev.Rune()
 		if a.hasControlSelection() {
 			a.clearLastAgentReply()
@@ -892,6 +991,12 @@ func (a *App) handleControlKey(ev *tcell.EventKey) bool {
 func (a *App) executePreview(input string) (agent.Response, error) {
 	if a.preview.Kind == CommandMemo {
 		return a.saveCurrentFileMemo(input)
+	}
+	if a.preview.Kind == CommandOpen {
+		return a.openFileCommand(input)
+	}
+	if a.preview.Kind == CommandWrite {
+		return a.writeFileCommand(input)
 	}
 	if a.agentExecutor == nil {
 		return agent.Response{}, errors.New("edit agent is not configured or ready")
@@ -919,12 +1024,17 @@ func (a *App) executePreview(input string) (agent.Response, error) {
 }
 
 func (a *App) beginControlExecution() {
+	a.executingControlInput = string(a.controlInput)
 	a.agentRunning = true
 	a.spinnerIndex = 0
 	a.voiceState = "sending"
 	switch a.preview.Kind {
 	case CommandMemo:
 		a.statusMessage = "Saving memo for the current target..."
+	case CommandOpen:
+		a.statusMessage = "Opening file in a new tab..."
+	case CommandWrite:
+		a.statusMessage = "Saving file to the requested path..."
 	default:
 		a.statusMessage = "Sending request to the edit agent..."
 	}
@@ -976,7 +1086,7 @@ func (a *App) executeAgentRequest(req agent.Request) (agent.Response, error) {
 }
 
 func (a *App) startControlExecution(input string) bool {
-	if a.screen == nil || a.preview.Kind == CommandMemo {
+	if a.screen == nil || a.preview.Kind == CommandMemo || a.preview.Kind == CommandOpen || a.preview.Kind == CommandWrite {
 		a.beginControlExecution()
 		return false
 	}
@@ -1021,10 +1131,15 @@ func (a *App) completeControlExecution(response agent.Response) {
 	a.agentRunning = false
 	a.stopSpinner()
 	a.lastCommand = a.preview.Summary()
+	kind := a.preview.Kind
 	a.lastAgentReply = response.Message
-	a.lastAgentResult = response.Message
+	if kind != CommandMemo && kind != CommandOpen && kind != CommandWrite {
+		a.lastAgentResult = response.Message
+	}
+	a.appendActiveTabHistory(a.executingControlInput, response.Message)
 	a.statusMessage = response.Message
 	a.preview = Preview{}
+	a.executingControlInput = ""
 	a.controlInput = nil
 	a.controlCursor = 0
 	a.clearControlSelection()
@@ -1043,11 +1158,47 @@ func (a *App) saveCurrentFileMemo(input string) (agent.Response, error) {
 		return agent.Response{}, errors.New("memo note is empty")
 	}
 	note = a.resolveMemoContent(input, note)
-	memoPath, err := memo.SaveFileMemo(a.systemMemoRoot, a.workspaceRoot, current.FilePath, note)
+	target, err := memo.SaveFileMemoDetailed(a.systemMemoRoot, a.workspaceRoot, current.FilePath, note)
 	if err != nil {
 		return agent.Response{}, fmt.Errorf("failed to save memo: %w", err)
 	}
-	return agent.Response{Mode: agent.ModeMessage, Message: "Saved memo to " + filepath.ToSlash(memoPath)}, nil
+	return agent.Response{Mode: agent.ModeMessage, Message: formatMemoSaveMessage(target)}, nil
+}
+
+func (a *App) openFileCommand(input string) (agent.Response, error) {
+	path, ok := openCommandPayload(input)
+	if !ok {
+		return agent.Response{}, errors.New("open path is empty")
+	}
+	resolvedPath, err := config.ExpandUserPath(path)
+	if err != nil {
+		return agent.Response{}, fmt.Errorf("failed to resolve open path: %w", err)
+	}
+	absPath, err := filepath.Abs(filepath.FromSlash(resolvedPath))
+	if err != nil {
+		return agent.Response{}, fmt.Errorf("failed to resolve open path: %w", err)
+	}
+	for index, tab := range a.tabs {
+		if filepath.Clean(tab.FilePath) != filepath.Clean(absPath) {
+			continue
+		}
+		a.saveCurrentTabState()
+		a.activeTab = index
+		a.loadCurrentTabState()
+		return agent.Response{Mode: agent.ModeMessage, Message: "Switched to " + filepath.ToSlash(absPath)}, nil
+	}
+	newTabs, err := loadTabsFromPaths([]string{absPath})
+	if err != nil {
+		return agent.Response{}, fmt.Errorf("failed to open file: %w", err)
+	}
+	if len(newTabs) == 0 {
+		return agent.Response{}, errors.New("no tab was created for the open path")
+	}
+	a.saveCurrentTabState()
+	a.tabs = append(a.tabs, newTabs[0])
+	a.activeTab = len(a.tabs) - 1
+	a.loadCurrentTabState()
+	return agent.Response{Mode: agent.ModeMessage, Message: "Opened " + filepath.ToSlash(absPath)}, nil
 }
 
 func (a *App) saveActiveTab() {
@@ -1056,15 +1207,7 @@ func (a *App) saveActiveTab() {
 		a.statusMessage = "Current tab is not backed by a file. Open a file path to save changes."
 		return
 	}
-	content := strings.Join(current.Content, "\n")
-	if current.TrailingNewline {
-		content += "\n"
-	}
-	perm := os.FileMode(0o644)
-	if info, err := os.Stat(current.FilePath); err == nil {
-		perm = info.Mode().Perm()
-	}
-	if err := os.WriteFile(current.FilePath, []byte(content), perm); err != nil {
+	if err := a.writeTabToPath(current, current.FilePath); err != nil {
 		a.statusMessage = fmt.Sprintf("Failed to save %s: %v", filepath.ToSlash(current.FilePath), err)
 		return
 	}
@@ -1072,15 +1215,73 @@ func (a *App) saveActiveTab() {
 	a.statusMessage = "Saved " + filepath.ToSlash(current.FilePath)
 }
 
+func (a *App) writeTabToPath(tab *Tab, targetPath string) error {
+	if strings.TrimSpace(targetPath) == "" {
+		return errors.New("target path is empty")
+	}
+	parentDir := filepath.Dir(targetPath)
+	if strings.TrimSpace(parentDir) != "" && parentDir != "." {
+		if err := os.MkdirAll(parentDir, 0o755); err != nil {
+			return err
+		}
+	}
+	content := strings.Join(tab.Content, "\n")
+	if tab.TrailingNewline {
+		content += "\n"
+	}
+	perm := os.FileMode(0o644)
+	if info, err := os.Stat(targetPath); err == nil {
+		perm = info.Mode().Perm()
+	}
+	if err := os.WriteFile(targetPath, []byte(content), perm); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *App) writeFileCommand(input string) (agent.Response, error) {
+	path, ok := writeCommandPayload(input)
+	if !ok {
+		return agent.Response{}, errors.New("write path is empty")
+	}
+	resolvedPath, err := config.ExpandUserPath(path)
+	if err != nil {
+		return agent.Response{}, fmt.Errorf("failed to resolve write path: %w", err)
+	}
+	absPath, err := filepath.Abs(filepath.FromSlash(resolvedPath))
+	if err != nil {
+		return agent.Response{}, fmt.Errorf("failed to resolve write path: %w", err)
+	}
+	current := &a.tabs[a.activeTab]
+	if err := a.writeTabToPath(current, absPath); err != nil {
+		return agent.Response{}, fmt.Errorf("failed to write file: %w", err)
+	}
+	current.FilePath = absPath
+	current.Title = filepath.Base(absPath)
+	current.Dirty = false
+	return agent.Response{Mode: agent.ModeMessage, Message: "Saved " + filepath.ToSlash(absPath)}, nil
+}
+
 func (a *App) resolveMemoContent(input, extracted string) string {
 	trimmed := strings.TrimSpace(input)
+	if _, payload, ok := explicitMemoPayload(trimmed); ok {
+		return payload
+	}
 	if (strings.HasPrefix(trimmed, "memo ") || strings.HasPrefix(trimmed, "메모 ")) && strings.TrimSpace(extracted) != "" {
 		return extracted
 	}
-	if strings.TrimSpace(a.lastAgentResult) != "" {
+	if isNaturalLanguageMemoRequest(trimmed) && strings.TrimSpace(a.lastAgentResult) != "" {
 		return a.lastAgentResult
 	}
 	return extracted
+}
+
+func formatMemoSaveMessage(target memo.Target) string {
+	label := string(target.Scope)
+	if strings.TrimSpace(target.Name) != "" {
+		label += "(" + target.Name + ")"
+	}
+	return "Saved " + label + " memo to " + filepath.ToSlash(target.Path)
 }
 
 func extractMemoNote(input string) string {
@@ -1255,6 +1456,43 @@ func (a *App) moveControlBoundary(toStart bool, selecting bool) {
 	a.ensureControlCursorInBounds()
 }
 
+func (a *App) moveControlWord(direction int, selecting bool) {
+	if selecting {
+		if a.controlSelectAnchor < 0 {
+			a.controlSelectAnchor = a.controlCursor
+		}
+	} else {
+		a.clearControlSelection()
+	}
+	if direction < 0 {
+		if a.controlCursor == 0 {
+			return
+		}
+		index := a.controlCursor
+		for index > 0 && !isWordRune(a.controlInput[index-1]) {
+			index--
+		}
+		for index > 0 && isWordRune(a.controlInput[index-1]) {
+			index--
+		}
+		a.controlCursor = index
+		a.ensureControlCursorInBounds()
+		return
+	}
+	if a.controlCursor >= len(a.controlInput) {
+		return
+	}
+	index := a.controlCursor
+	for index < len(a.controlInput) && isWordRune(a.controlInput[index]) {
+		index++
+	}
+	for index < len(a.controlInput) && !isWordRune(a.controlInput[index]) {
+		index++
+	}
+	a.controlCursor = index
+	a.ensureControlCursorInBounds()
+}
+
 func (a *App) ensureControlCursorInBounds() {
 	if a.controlCursor < 0 {
 		a.controlCursor = 0
@@ -1299,6 +1537,7 @@ func (a *App) nextTab() {
 	a.saveCurrentTabState()
 	a.activeTab = (a.activeTab + 1) % len(a.tabs)
 	a.loadCurrentTabState()
+	a.historyScroll = 0
 	a.statusMessage = "Switched to tab " + a.tabs[a.activeTab].Title
 }
 
@@ -1309,6 +1548,7 @@ func (a *App) prevTab() {
 		a.activeTab = len(a.tabs) - 1
 	}
 	a.loadCurrentTabState()
+	a.historyScroll = 0
 	a.statusMessage = "Switched to tab " + a.tabs[a.activeTab].Title
 }
 
@@ -1323,6 +1563,8 @@ func (a *App) saveCurrentTabState() {
 	tab.CursorY = a.cursorY
 	tab.SelectionAnchorX = a.selectionAnchorX()
 	tab.SelectionAnchorY = a.selectionAnchor
+	tab.LastAgentReply = a.lastAgentReply
+	tab.LastAgentResult = a.lastAgentResult
 }
 
 func (a *App) markActiveTabDirty() {
@@ -1330,6 +1572,22 @@ func (a *App) markActiveTabDirty() {
 		return
 	}
 	a.tabs[a.activeTab].Dirty = true
+}
+
+func (a *App) appendActiveTabHistory(prompt, reply string) {
+	if len(a.tabs) == 0 || a.activeTab < 0 || a.activeTab >= len(a.tabs) {
+		return
+	}
+	prompt = strings.TrimSpace(prompt)
+	reply = strings.TrimSpace(reply)
+	if prompt == "" && reply == "" {
+		return
+	}
+	tab := &a.tabs[a.activeTab]
+	tab.History = append(tab.History, historyEntry{Prompt: prompt, Reply: reply})
+	if len(tab.History) > 100 {
+		tab.History = append([]historyEntry(nil), tab.History[len(tab.History)-100:]...)
+	}
 }
 
 func (a *App) loadCurrentTabState() {
@@ -1342,6 +1600,8 @@ func (a *App) loadCurrentTabState() {
 	a.cursorX = tab.CursorX
 	a.cursorY = tab.CursorY
 	a.setSelectionAnchor(tab.SelectionAnchorX, tab.SelectionAnchorY)
+	a.lastAgentReply = tab.LastAgentReply
+	a.lastAgentResult = tab.LastAgentResult
 	a.ensureCursorInBounds()
 	a.syncViewport()
 	tab.CursorX = a.cursorX
@@ -1727,17 +1987,19 @@ func (a *App) activeLineRange() (int, int) {
 
 func (a *App) indentSelection() {
 	start, end := a.activeLineRange()
+	indentWidth := len([]rune(a.indentUnit()))
 
 	for index := start; index <= end; index++ {
 		a.tabs[a.activeTab].Content[index] = a.indentUnit() + a.tabs[a.activeTab].Content[index]
 	}
 	a.markActiveTabDirty()
 	if a.hasSelection() {
-		a.selectionAnchor = start
-		a.cursorY = end
+		a.selectionAnchorCol += indentWidth
+		a.cursorX += indentWidth
 	} else {
-		a.cursorX += len([]rune(a.indentUnit()))
+		a.cursorX += indentWidth
 	}
+	a.ensureCursorInBounds()
 	if start == end {
 		a.statusMessage = fmt.Sprintf("Indented line %d.", start+1)
 	} else {
@@ -1748,6 +2010,7 @@ func (a *App) indentSelection() {
 func (a *App) outdentSelection() {
 	start, end := a.activeLineRange()
 
+	removedOnAnchor := 0
 	removedOnCursor := 0
 	changed := false
 	for index := start; index <= end; index++ {
@@ -1759,16 +2022,29 @@ func (a *App) outdentSelection() {
 		if index == a.cursorY {
 			removedOnCursor = removed
 		}
+		if index == a.selectionAnchor {
+			removedOnAnchor = removed
+		}
 	}
 	if changed {
 		a.markActiveTabDirty()
 	}
-	if !a.hasSelection() {
+	if a.hasSelection() {
+		a.selectionAnchorCol -= removedOnAnchor
+		if a.selectionAnchorCol < 0 {
+			a.selectionAnchorCol = 0
+		}
+		a.cursorX -= removedOnCursor
+		if a.cursorX < 0 {
+			a.cursorX = 0
+		}
+	} else {
 		a.cursorX -= removedOnCursor
 		if a.cursorX < 0 {
 			a.cursorX = 0
 		}
 	}
+	a.ensureCursorInBounds()
 	if start == end {
 		a.statusMessage = fmt.Sprintf("Outdented line %d.", start+1)
 	} else {
@@ -2208,6 +2484,10 @@ func (a *App) draw() {
 		a.screen.HideCursor()
 		a.drawHelpDialog(w, h)
 	}
+	if a.historyVisible {
+		a.screen.HideCursor()
+		a.drawHistoryDialog(w, h)
+	}
 	if a.quitConfirm {
 		a.screen.HideCursor()
 		a.drawQuitDialog(w, h)
@@ -2256,12 +2536,12 @@ func (a *App) drawEditSurface(x, y, width, height int) {
 		a.drawText(x+1, lineY, styleGutter(), gutter)
 		a.drawTextWithVisibleTabs(x+4, lineY, lineIndex, style, []rune(content[lineIndex]), a.viewportLeft, visibleWidth)
 	}
-	footer := fmt.Sprintf("Focus:%s  Scope:%s  Save:[Ctrl+S]  Indent:[Tab/Shift+Tab]  Width:[Alt+0..4]  Tabs:[Alt+,/Alt+. or Ctrl+Tab/Ctrl+Shift+Tab]  Block:[F2/Ctrl+Space/Ctrl+[]  Ctrl+Up/Down:[line or block]  Control:[Ctrl+G]  Quit:[Ctrl+Q]", a.focusLabel(), a.currentScope())
+	footer := fmt.Sprintf("Focus:%s  Scope:%s  Save:[Ctrl+S]  Indent:[Tab/Shift+Tab]  Width:[Alt+0..4]  Tabs:[Alt+,/Alt+.]  Block:[F2]  Ctrl+Up/Down:[line or block]  Control:[Ctrl+G]  Quit:[Ctrl+Q]", a.focusLabel(), a.currentScope())
 	if a.helpVisible {
 		footer = fmt.Sprintf("Focus:%s  Scope:%s  Help:[Esc closes]", a.focusLabel(), a.currentScope())
 	}
 	a.drawText(x+1, y+height-1, styleMuted(), trimRunes(footer, width-2))
-	if a.focus == focusEditor && !a.helpVisible && !a.quitConfirm {
+	if a.focus == focusEditor && !a.helpVisible && !a.historyVisible && !a.quitConfirm {
 		cursorX := x + 4 + (visualColumnForRunes([]rune(content[a.cursorY]), a.cursorX) - a.viewportLeft)
 		cursorY := y + 1 + (a.cursorY - a.viewportTop)
 		maxX := x + width - 2
@@ -2294,13 +2574,13 @@ func (a *App) drawControlPanel(x, y, width, height int) {
 		preview = "Preview: " + a.preview.Summary()
 	}
 	a.drawText(x+1, y+2, stylePreview(), trimRunes(preview, width-2))
-	footer := "Examples: inspect recent change | simplify this block | show diff only"
+	footer := "Examples: /open README.md | /write notes.txt | inspect recent change"
 	style := styleMuted()
 	if a.agentRunning {
 		footer = fmt.Sprintf("Sending %s", spinnerFrames[a.spinnerIndex])
 		style = stylePreview()
 	} else if strings.TrimSpace(a.lastAgentReply) != "" {
-		footer = "Reply: " + a.lastAgentReply
+		footer = "Reply: " + ellipsizeRunes(a.lastAgentReply, max(0, width-10))
 		style = stylePreview()
 	}
 	a.drawText(x+1, y+3, style, trimRunes(footer, width-2))
@@ -2357,6 +2637,7 @@ func (a *App) drawStatusSurface(x, y, width, height int) {
 		"tab: " + a.tabs[a.activeTab].Title,
 		"scope: " + a.currentScope(),
 		"indent: " + a.indentModeLabel(),
+		"slash: /open /write /saveas",
 		"agent: " + a.agentState(),
 		"model: " + a.agentProfileLabel(),
 		"voice: " + a.voiceState,
@@ -2375,57 +2656,11 @@ func (a *App) drawStatusSurface(x, y, width, height int) {
 }
 
 func (a *App) drawHelpDialog(screenWidth, screenHeight int) {
-	lines := []string{
-		"gdedit help",
-		"",
-		"F1 opens this help dialog.",
-		"Esc closes the help dialog, clears a preview, or clears a selection.",
-		"",
-		"Editor",
-		"  Tab              insert literal tab, or indent active selection",
-		"  Shift+Tab        outdent current line or selection",
-		"  Alt+.            next tab",
-		"  Alt+,            previous tab",
-		"  Alt+0            use literal tabs for selection indentation",
-		"  Alt+1..Alt+4     set indentation width in spaces",
-		"  colored »        visible marker for literal tab characters",
-		"  Ctrl+Tab         same intent, but many terminals swallow it",
-		"  Ctrl+Shift+Tab   same intent, but many terminals swallow it",
-		"  F2               select current block, then parent block",
-		"  Ctrl+Space       same intent, but some terminals drop it",
-		"  Ctrl+[           same intent, but some terminals treat it as Esc",
-		"  Ctrl+Down        insert a blank line above, or move selected block",
-		"  Ctrl+Up          remove a blank line above, or move selected block",
-		"  Home / End       move caret to start or end of line",
-		"  PageUp / PageDn  move caret by larger vertical steps",
-		"  Ctrl+G           focus control hub",
-		"  Shift/Alt+Arrow  expand or shrink text selection",
-		"  Ctrl+Arrow       move caret by word",
-		"  Ctrl+Shift/Alt   select by word with Left/Right",
-		"  Shift/Alt+Home   select to line start",
-		"  Shift/Alt+End    select to line end",
-		"  Shift/Alt+Page   select by larger vertical steps",
-		"  Ctrl+A           select the full editor document",
-		"  Ctrl+S           save the current file-backed tab",
-		"  Ctrl+C / Ctrl+X  copy or cut to system clipboard with internal fallback",
-		"  Ctrl+V           paste from system clipboard or internal fallback",
-		"  Ctrl+Up/Down     swap selected block with adjacent line",
-		"  Ctrl+Q           open quit confirmation",
-		"",
-		"Control hub",
-		"  Talk and inspect run on Enter.",
-		"  Edit and memo commands preview first, then confirm on Enter.",
-		"  Ctrl+A           select all control input",
-		"  Shift/Alt+Arrow  expand or shrink control selection",
-		"  Ctrl+C / Ctrl+X  copy or cut control input",
-		"  Ctrl+V           paste or replace control selection",
-		"  Example: simplify this block",
-		"  Example: inspect recent change",
-	}
+	lines := a.helpLines()
 
 	maxLen := 0
 	for _, line := range lines {
-		if n := len([]rune(line)); n > maxLen {
+		if n := visualWidthString(line); n > maxLen {
 			maxLen = n
 		}
 	}
@@ -2440,6 +2675,24 @@ func (a *App) drawHelpDialog(screenWidth, screenHeight int) {
 	}
 	x := (screenWidth - width) / 2
 	y := (screenHeight - height) / 2
+	visibleLines := height - 2
+	showScrollFooter := len(lines) > visibleLines && visibleLines > 1
+	if showScrollFooter {
+		visibleLines--
+	}
+	if visibleLines < 1 {
+		visibleLines = 1
+	}
+	maxScroll := len(lines) - visibleLines
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if a.helpScroll > maxScroll {
+		a.helpScroll = maxScroll
+	}
+	if a.helpScroll < 0 {
+		a.helpScroll = 0
+	}
 
 	for dy := y; dy < y+height; dy++ {
 		for dx := x; dx < x+width; dx++ {
@@ -2448,13 +2701,289 @@ func (a *App) drawHelpDialog(screenWidth, screenHeight int) {
 	}
 
 	a.drawBox(x, y, width, height, styleDialogBorder(), "Help")
-	for i := 0; i < len(lines) && i < height-2; i++ {
+	for i := 0; i < visibleLines && i+a.helpScroll < len(lines); i++ {
 		style := styleDialogText()
-		if i == 0 {
+		if i+a.helpScroll == 0 {
 			style = styleDialogTitle()
 		}
-		a.drawText(x+2, y+1+i, style, trimRunes(lines[i], width-4))
+		a.drawText(x+2, y+1+i, style, trimRunes(lines[i+a.helpScroll], width-4))
 	}
+	if showScrollFooter {
+		footer := fmt.Sprintf("Scroll: %d/%d  Up/Down moves  Esc closes", a.helpScroll+1, maxScroll+1)
+		a.drawText(x+2, y+height-2, styleMuted(), trimRunes(footer, width-4))
+	}
+}
+
+func (a *App) drawHistoryDialog(screenWidth, screenHeight int) {
+	width := screenWidth - 4
+	if width > 100 {
+		width = 100
+	}
+	if width < 20 {
+		width = 20
+	}
+	contentWidth := width - 4
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
+	lines := a.historyLinesForWidth(contentWidth)
+	maxLen := 0
+	for _, line := range lines {
+		if n := visualWidthString(line); n > maxLen {
+			maxLen = n
+		}
+	}
+	width = maxLen + 4
+	height := len(lines) + 2
+	if width > screenWidth-4 {
+		width = screenWidth - 4
+	}
+	if height > screenHeight-2 {
+		height = screenHeight - 2
+	}
+	x := (screenWidth - width) / 2
+	y := (screenHeight - height) / 2
+	visibleLines := height - 2
+	showScrollFooter := len(lines) > visibleLines && visibleLines > 1
+	if showScrollFooter {
+		visibleLines--
+	}
+	if visibleLines < 1 {
+		visibleLines = 1
+	}
+	maxScroll := len(lines) - visibleLines
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if a.historyScroll > maxScroll {
+		a.historyScroll = maxScroll
+	}
+	if a.historyScroll < 0 {
+		a.historyScroll = 0
+	}
+	for dy := y; dy < y+height; dy++ {
+		for dx := x; dx < x+width; dx++ {
+			a.screen.SetContent(dx, dy, ' ', nil, styleDialogFill())
+		}
+	}
+	title := "History"
+	if len(a.tabs) > 0 {
+		title = "History: " + a.tabs[a.activeTab].Title
+	}
+	a.drawBox(x, y, width, height, styleDialogBorder(), title)
+	for i := 0; i < visibleLines && i+a.historyScroll < len(lines); i++ {
+		style := styleDialogText()
+		if i+a.historyScroll == 0 {
+			style = styleDialogTitle()
+		}
+		a.drawText(x+2, y+1+i, style, lines[i+a.historyScroll])
+	}
+	if showScrollFooter {
+		footer := fmt.Sprintf("Scroll: %d/%d  Up/Down moves  Esc closes", a.historyScroll+1, maxScroll+1)
+		a.drawText(x+2, y+height-2, styleMuted(), trimRunes(footer, width-4))
+	}
+}
+
+func (a *App) historyLines() []string {
+	return a.historyLinesForWidth(72)
+}
+
+func (a *App) historyLinesForWidth(maxWidth int) []string {
+	lines := []string{"conversation history", ""}
+	if len(a.tabs) == 0 || a.activeTab < 0 || a.activeTab >= len(a.tabs) {
+		return append(lines, "(no active tab)")
+	}
+	history := a.tabs[a.activeTab].History
+	if len(history) == 0 {
+		return append(lines, "(no conversation history for this tab yet)")
+	}
+	if maxWidth < 8 {
+		maxWidth = 8
+	}
+	for i, entry := range history {
+		lines = append(lines, wrapPrefixedLines(fmt.Sprintf("[%d] You: ", i+1), entry.Prompt, maxWidth)...)
+		lines = append(lines, wrapPrefixedLines("    Reply: ", entry.Reply, maxWidth)...)
+		lines = append(lines, "")
+	}
+	return lines
+}
+
+func (a *App) maxHistoryScroll() int {
+	visibleLines := 18
+	if a.screen != nil {
+		_, h := a.screen.Size()
+		visibleLines = h - 4
+	}
+	lines := a.historyLinesForWidth(72)
+	if len(lines) > visibleLines && visibleLines > 1 {
+		visibleLines--
+	}
+	if visibleLines < 1 {
+		visibleLines = 1
+	}
+	maxScroll := len(lines) - visibleLines
+	if maxScroll < 0 {
+		return 0
+	}
+	return maxScroll
+}
+
+func wrapPrefixedLines(prefix, text string, width int) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return []string{prefix}
+	}
+	available := width - visualWidthString(prefix)
+	if available < 8 {
+		available = 8
+	}
+	wrapped := wrapText(text, available)
+	parts := strings.Split(wrapped, "\n")
+	lines := make([]string, 0, len(parts))
+	indent := strings.Repeat(" ", visualWidthString(prefix))
+	for i, part := range parts {
+		if i == 0 {
+			lines = append(lines, prefix+part)
+			continue
+		}
+		lines = append(lines, indent+part)
+	}
+	return lines
+}
+
+func wrapText(text string, width int) string {
+	if width <= 0 {
+		return text
+	}
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return ""
+	}
+	lines := []string{}
+	firstParts := splitByVisualWidth(words[0], width)
+	current := firstParts[0]
+	for _, extra := range firstParts[1:] {
+		lines = append(lines, current)
+		current = extra
+	}
+	currentWidth := visualWidthString(current)
+	for _, word := range words[1:] {
+		wordParts := splitByVisualWidth(word, width)
+		wordHead := wordParts[0]
+		wordWidth := visualWidthString(wordHead)
+		if currentWidth+1+wordWidth > width {
+			lines = append(lines, current)
+			current = wordHead
+			currentWidth = wordWidth
+		} else {
+			current += " " + wordHead
+			currentWidth += 1 + wordWidth
+		}
+		for _, extra := range wordParts[1:] {
+			lines = append(lines, current)
+			current = extra
+			currentWidth = visualWidthString(extra)
+		}
+	}
+	lines = append(lines, current)
+	return strings.Join(lines, "\n")
+}
+
+func splitByVisualWidth(text string, width int) []string {
+	if width <= 0 || text == "" {
+		return []string{text}
+	}
+	parts := []string{}
+	current := []rune{}
+	currentWidth := 0
+	for _, r := range []rune(text) {
+		rw := runeCellWidth(displayRune(r))
+		if currentWidth+rw > width && len(current) > 0 {
+			parts = append(parts, string(current))
+			current = []rune{r}
+			currentWidth = rw
+			continue
+		}
+		current = append(current, r)
+		currentWidth += rw
+	}
+	if len(current) > 0 {
+		parts = append(parts, string(current))
+	}
+	if len(parts) == 0 {
+		return []string{text}
+	}
+	return parts
+}
+
+func (a *App) helpLines() []string {
+	return []string{
+		"gdedit help",
+		"",
+		"F1 opens this help dialog.",
+		"F3 opens conversation history for the active tab.",
+		"Esc closes the help dialog, clears a preview, or clears a selection.",
+		"",
+		"Common",
+		"  Alt+.            next tab",
+		"  Alt+,            previous tab",
+		"  Ctrl+A           select all in the active surface",
+		"  Ctrl+C / Ctrl+X  copy or cut the current selection",
+		"  Ctrl+V           paste, or replace the current selection",
+		"  Ctrl+Q           open quit confirmation",
+		"  F3               open history for the active tab",
+		"  Shift/Alt+Arrow  expand or shrink selection",
+		"  Home / End       move caret to start or end of line",
+		"  Ctrl+Arrow       move caret by word",
+		"  Ctrl+Shift/Alt   select by word with Left/Right",
+		"  Shift/Alt+Home   select to line start",
+		"  Shift/Alt+End    select to line end",
+		"  Shift/Alt+Page   select by larger vertical steps",
+		"",
+		"Editor",
+		"  Ctrl+G           focus control hub",
+		"  No selection: Tab inserts a literal tab",
+		"  With selection: Tab indents the selected lines",
+		"  With selection: Shift+Tab outdents the selected lines",
+		"  Alt+0            use literal tabs for selection indentation",
+		"  Alt+1..Alt+4     set indentation width in spaces",
+		"  colored »        visible marker for literal tab characters",
+		"  F2               select current block, then parent block",
+		"  PageUp / PageDn  move caret by larger vertical steps",
+		"  No selection: Ctrl+Down inserts a blank line above",
+		"  No selection: Ctrl+Up removes a blank line above",
+		"  With selection: Ctrl+Down moves the selected block down",
+		"  With selection: Ctrl+Up moves the selected block up",
+		"  Ctrl+S           save the current file-backed tab",
+		"",
+		"Control hub",
+		"  Ctrl+G           return to the editor",
+		"  Talk, inspect, /open, and /write run on Enter.",
+		"  Edit and memo commands preview first, then confirm on Enter.",
+		"  Example: /open README.md",
+		"  Example: /write notes.txt",
+		"  Example: /saveas \"notes with spaces.txt\"",
+		"  Example: inspect recent change",
+	}
+}
+
+func (a *App) maxHelpScroll() int {
+	visibleLines := 18
+	if a.screen != nil {
+		_, h := a.screen.Size()
+		visibleLines = h - 4
+	}
+	if len(a.helpLines()) > visibleLines && visibleLines > 1 {
+		visibleLines--
+	}
+	if visibleLines < 1 {
+		visibleLines = 1
+	}
+	maxScroll := len(a.helpLines()) - visibleLines
+	if maxScroll < 0 {
+		return 0
+	}
+	return maxScroll
 }
 
 func (a *App) drawQuitDialog(screenWidth, screenHeight int) {
@@ -2653,14 +3182,44 @@ func trimRunes(input string, max int) string {
 	if max <= 0 {
 		return ""
 	}
-	runes := []rune(input)
-	if len(runes) <= max {
+	if visualWidthString(input) <= max {
 		return input
 	}
-	if max <= 1 {
-		return string(runes[:max])
+	if max <= 3 {
+		runes := []rune(input)
+		out := []rune{}
+		width := 0
+		for _, r := range runes {
+			rw := runeCellWidth(displayRune(r))
+			if width+rw > max {
+				break
+			}
+			out = append(out, r)
+			width += rw
+		}
+		return string(out)
 	}
-	return string(runes[:max-1]) + "..."
+	budget := max - 3
+	runes := []rune(input)
+	out := []rune{}
+	width := 0
+	for _, r := range runes {
+		rw := runeCellWidth(displayRune(r))
+		if width+rw > budget {
+			break
+		}
+		out = append(out, r)
+		width += rw
+	}
+	return string(out) + "..."
+}
+
+func ellipsizeRunes(input string, max int) string {
+	return trimRunes(input, max)
+}
+
+func visualWidthString(input string) int {
+	return visualColumnForRunes([]rune(input), len([]rune(input)))
 }
 
 func styleNormal() tcell.Style {

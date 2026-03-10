@@ -46,6 +46,9 @@ func TestCommandRequiresConfirmationPolicy(t *testing.T) {
 	if !commandRequiresConfirmation(CommandMemo) {
 		t.Fatal("memo should still require confirmation")
 	}
+	if commandRequiresConfirmation(CommandOpen) {
+		t.Fatal("open should execute without confirmation")
+	}
 }
 
 func TestParseAction(t *testing.T) {
@@ -57,7 +60,15 @@ func TestParseAction(t *testing.T) {
 		{input: "memo remember this setting", wantKind: CommandMemo, wantText: "save memo for current file"},
 		{input: "메모 이 파일은 유지", wantKind: CommandMemo, wantText: "save memo for current file"},
 		{input: "설정 내용을 메모해줘 메모파일은 앱의 이름으로", wantKind: CommandMemo, wantText: "save memo for current file"},
+		{input: "이 내용을 메모를 추가해줘", wantKind: CommandMemo, wantText: "save memo for current file"},
+		{input: "wezterm 설정 메모 저장해줘", wantKind: CommandMemo, wantText: "save memo for current file"},
+		{input: "그러면 메모를 추가해줘 -> -.test", wantKind: CommandMemo, wantText: "save memo for current file"},
+		{input: "내가 작성한 것을 추가해줄 수 있어? -> -.Test", wantKind: CommandMemo, wantText: "save memo for current file"},
+		{input: "이 파일에 해당하는 메모를 읽어서 장점을 말해줘", wantKind: CommandRoute, wantText: "resolve against active edit context"},
 		{input: "메모리 설정을 설명해줘", wantKind: CommandRoute, wantText: "resolve against active edit context"},
+		{input: "/open notes.txt", wantKind: CommandOpen, wantText: "open file in a new tab"},
+		{input: "/write notes.txt", wantKind: CommandWrite, wantText: "save current tab to path"},
+		{input: "/saveas notes.txt", wantKind: CommandWrite, wantText: "save current tab to path"},
 		{input: "안녕하세요", wantKind: CommandTalk, wantText: "talk with edit agent"},
 		{input: "hello", wantKind: CommandTalk, wantText: "talk with edit agent"},
 		{input: "rename this symbol", wantKind: CommandEdit, wantText: "edit current scope"},
@@ -73,6 +84,87 @@ func TestParseAction(t *testing.T) {
 		gotKind, gotText := parseAction(test.input)
 		if gotKind != test.wantKind || gotText != test.wantText {
 			t.Fatalf("parseAction(%q) = (%s, %q), want (%s, %q)", test.input, gotKind, gotText, test.wantKind, test.wantText)
+		}
+	}
+}
+
+func TestIsNaturalLanguageMemoRequest(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{input: "설정 내용을 메모해줘", want: true},
+		{input: "이 내용을 메모를 추가해줘", want: true},
+		{input: "wezterm 설정 메모 저장해줘", want: true},
+		{input: "add memo for this file", want: true},
+		{input: "이 파일에 해당하는 메모를 읽어서 장점을 말해줘", want: false},
+		{input: "메모리 설정을 설명해줘", want: false},
+		{input: "please explain this config", want: false},
+	}
+
+	for _, test := range tests {
+		if got := isNaturalLanguageMemoRequest(test.input); got != test.want {
+			t.Fatalf("isNaturalLanguageMemoRequest(%q) = %t, want %t", test.input, got, test.want)
+		}
+	}
+}
+
+func TestMemoCommandPayloadPrefersExplicitArrowPayload(t *testing.T) {
+	tests := []struct {
+		input  string
+		want   string
+		wantOK bool
+	}{
+		{input: "그러면 메모를 추가해줘 -> -.test", want: "-.test", wantOK: true},
+		{input: "내가 작성한 것을 추가해줄 수 있어? -> -.Test", want: "-.Test", wantOK: true},
+		{input: "/open foo -> bar", want: "", wantOK: false},
+	}
+
+	for _, test := range tests {
+		got, ok := memoCommandPayload(test.input)
+		if ok != test.wantOK || got != test.want {
+			t.Fatalf("memoCommandPayload(%q) = (%q, %t), want (%q, %t)", test.input, got, ok, test.want, test.wantOK)
+		}
+	}
+}
+
+func TestOpenCommandPayload(t *testing.T) {
+	tests := []struct {
+		input  string
+		want   string
+		wantOK bool
+	}{
+		{input: "/open notes.txt", want: "notes.txt", wantOK: true},
+		{input: " /open ./docs/readme.md ", want: "./docs/readme.md", wantOK: true},
+		{input: "/open", want: "", wantOK: false},
+		{input: "open notes.txt", want: "", wantOK: false},
+	}
+
+	for _, test := range tests {
+		got, ok := openCommandPayload(test.input)
+		if ok != test.wantOK || got != test.want {
+			t.Fatalf("openCommandPayload(%q) = (%q, %t), want (%q, %t)", test.input, got, ok, test.want, test.wantOK)
+		}
+	}
+}
+
+func TestWriteCommandPayload(t *testing.T) {
+	tests := []struct {
+		input  string
+		want   string
+		wantOK bool
+	}{
+		{input: "/write notes.txt", want: "notes.txt", wantOK: true},
+		{input: "/saveas \"notes with spaces.txt\"", want: "notes with spaces.txt", wantOK: true},
+		{input: "/write './docs/file name.md'", want: "./docs/file name.md", wantOK: true},
+		{input: "/write", want: "", wantOK: false},
+		{input: "/saveas", want: "", wantOK: false},
+	}
+
+	for _, test := range tests {
+		got, ok := writeCommandPayload(test.input)
+		if ok != test.wantOK || got != test.want {
+			t.Fatalf("writeCommandPayload(%q) = (%q, %t), want (%q, %t)", test.input, got, ok, test.want, test.wantOK)
 		}
 	}
 }

@@ -104,6 +104,87 @@ func TestSaveFileMemoRoutesAppConfigToSystemAppMemo(t *testing.T) {
 	}
 }
 
+func TestSaveFileMemoPrefersAppScopeOverHomeWorkspaceProjectMatch(t *testing.T) {
+	home := t.TempDir()
+	originalHome := userHomeDir
+	userHomeDir = func() (string, error) { return home, nil }
+	defer func() { userHomeDir = originalHome }()
+
+	systemRoot := filepath.Join(t.TempDir(), "memo-root")
+	workspace := home
+	filePath := filepath.Join(home, ".wezterm.lua")
+	if err := os.WriteFile(filePath, []byte("return {}\n"), 0o600); err != nil {
+		t.Fatalf("write app config: %v", err)
+	}
+
+	target, err := SaveFileMemoDetailed(systemRoot, workspace, filePath, "Prefer app scope even when workspace is home.")
+	if err != nil {
+		t.Fatalf("save app memo: %v", err)
+	}
+	if target.Scope != ScopeApp {
+		t.Fatalf("unexpected target scope: %s", target.Scope)
+	}
+	if got := filepath.ToSlash(target.Path); !strings.Contains(got, "/app/wezterm.md") {
+		t.Fatalf("unexpected app memo path: %s", target.Path)
+	}
+}
+
+func TestSaveFileMemoRoutesXdgConfigIntoNamedAppScope(t *testing.T) {
+	home := t.TempDir()
+	originalHome := userHomeDir
+	userHomeDir = func() (string, error) { return home, nil }
+	defer func() { userHomeDir = originalHome }()
+
+	systemRoot := filepath.Join(t.TempDir(), "memo-root")
+	workspace := t.TempDir()
+	filePath := filepath.Join(home, ".config", "wezterm", "wezterm.lua")
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		t.Fatalf("mkdir xdg config dir: %v", err)
+	}
+	if err := os.WriteFile(filePath, []byte("return {}\n"), 0o600); err != nil {
+		t.Fatalf("write xdg app config: %v", err)
+	}
+
+	memoPath, err := SaveFileMemo(systemRoot, workspace, filePath, "Keep the terminal theme consistent.")
+	if err != nil {
+		t.Fatalf("save xdg app memo: %v", err)
+	}
+	if got := filepath.ToSlash(memoPath); !strings.Contains(got, "/app/wezterm.md") {
+		t.Fatalf("unexpected xdg app memo path: %s", memoPath)
+	}
+}
+
+func TestSaveFileMemoRoutesSystemFileToSystemScope(t *testing.T) {
+	home := t.TempDir()
+	originalHome := userHomeDir
+	userHomeDir = func() (string, error) { return home, nil }
+	defer func() { userHomeDir = originalHome }()
+
+	systemRoot := filepath.Join(t.TempDir(), "memo-root")
+	workspace := t.TempDir()
+	filePath := filepath.Join(t.TempDir(), "notes", "machine.txt")
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		t.Fatalf("mkdir system file dir: %v", err)
+	}
+	if err := os.WriteFile(filePath, []byte("machine level notes\n"), 0o600); err != nil {
+		t.Fatalf("write system file: %v", err)
+	}
+
+	target, err := SaveFileMemoDetailed(systemRoot, workspace, filePath, "Track machine-specific setup here.")
+	if err != nil {
+		t.Fatalf("save system memo: %v", err)
+	}
+	if target.Scope != ScopeSystem {
+		t.Fatalf("unexpected target scope: %s", target.Scope)
+	}
+	if target.Name != "machine" {
+		t.Fatalf("unexpected target name: %s", target.Name)
+	}
+	if got := filepath.ToSlash(target.Path); !strings.Contains(got, "/system/machine.md") {
+		t.Fatalf("unexpected system memo path: %s", target.Path)
+	}
+}
+
 func TestBuildMemoEntryFormatsReadableDetails(t *testing.T) {
 	entry := buildMemoEntry("/tmp/app.conf", "First sentence. Second sentence with more detail! Third sentence?")
 	if !strings.Contains(entry, "details:") {
@@ -117,5 +198,38 @@ func TestBuildMemoEntryFormatsReadableDetails(t *testing.T) {
 	}
 	if !strings.Contains(entry, "- Third sentence?") {
 		t.Fatalf("missing third bullet: %s", entry)
+	}
+}
+
+func TestBuildMemoEntryUsesExplicitDashDotLineBreaks(t *testing.T) {
+	entry := buildMemoEntry("/tmp/app.conf", "keep wezterm shell as pwsh -. preserve background image -. review key bindings")
+	if !strings.Contains(entry, "- keep wezterm shell as pwsh") {
+		t.Fatalf("missing first explicit memo line: %s", entry)
+	}
+	if !strings.Contains(entry, "- preserve background image") {
+		t.Fatalf("missing second explicit memo line: %s", entry)
+	}
+	if !strings.Contains(entry, "- review key bindings") {
+		t.Fatalf("missing third explicit memo line: %s", entry)
+	}
+}
+
+func TestBuildMemoEntryConvertsCompactDashDotTokensIntoBulletLines(t *testing.T) {
+	entry := buildMemoEntry("/tmp/app.conf", "-.test1 -.test2")
+	if !strings.Contains(entry, "details:\n- test1\n- test2") {
+		t.Fatalf("expected compact dash-dot tokens to become separate bullet lines: %s", entry)
+	}
+	if strings.Contains(entry, "-.test1") || strings.Contains(entry, "-.test2") {
+		t.Fatalf("did not expect raw dash-dot tokens to remain in memo entry: %s", entry)
+	}
+}
+
+func TestBuildMemoEntryConvertsSingleDashDotTokenIntoSingleBulletLine(t *testing.T) {
+	entry := buildMemoEntry("/tmp/app.conf", "-.test")
+	if !strings.Contains(entry, "details:\n- test") {
+		t.Fatalf("expected single dash-dot token to become one bullet line: %s", entry)
+	}
+	if strings.Contains(entry, "-.test") {
+		t.Fatalf("did not expect raw dash-dot token to remain in memo entry: %s", entry)
 	}
 }
