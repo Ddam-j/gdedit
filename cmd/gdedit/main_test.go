@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"gdedit/internal/config"
+	"gdedit/internal/processsync"
 )
 
 func TestRunDoctorReportsEditAgentConfig(t *testing.T) {
@@ -70,6 +71,8 @@ func TestResolveLaunch(t *testing.T) {
 		args     []string
 		wantMode launchMode
 		wantPath string
+		wantID   string
+		wantName string
 		wantErr  bool
 	}{
 		{args: nil, wantMode: launchScratch},
@@ -78,12 +81,16 @@ func TestResolveLaunch(t *testing.T) {
 		{args: []string{"--help"}, wantMode: launchHelp},
 		{args: []string{"--version"}, wantMode: launchVersion},
 		{args: []string{"--doctor"}, wantMode: launchDoctor},
+		{args: []string{"--sync", "mynamr", "demo-rule"}, wantMode: launchSync, wantID: "mynamr", wantName: "demo-rule"},
+		{args: []string{"--sync-register", "mynamr", "--read", "show {name}", "--write", "update {name}"}, wantMode: launchSyncRegister, wantID: "mynamr"},
+		{args: []string{"--sync-list"}, wantMode: launchSyncList},
+		{args: []string{"--sync-remove", "mynamr"}, wantMode: launchSyncRemove, wantID: "mynamr"},
 		{args: []string{"note.txt"}, wantMode: launchFile, wantPath: "note.txt"},
 		{args: []string{"one", "two"}, wantErr: true},
 	}
 
 	for _, tt := range tests {
-		mode, path, err := resolveLaunch(tt.args)
+		req, err := resolveLaunch(tt.args)
 		if tt.wantErr {
 			if err == nil {
 				t.Fatalf("expected error for args %v", tt.args)
@@ -93,12 +100,63 @@ func TestResolveLaunch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error for args %v: %v", tt.args, err)
 		}
-		if mode != tt.wantMode {
-			t.Fatalf("unexpected mode for args %v: got %v want %v", tt.args, mode, tt.wantMode)
+		if req.mode != tt.wantMode {
+			t.Fatalf("unexpected mode for args %v: got %v want %v", tt.args, req.mode, tt.wantMode)
 		}
-		if path != tt.wantPath {
-			t.Fatalf("unexpected path for args %v: got %q want %q", tt.args, path, tt.wantPath)
+		if req.filePath != tt.wantPath {
+			t.Fatalf("unexpected path for args %v: got %q want %q", tt.args, req.filePath, tt.wantPath)
 		}
+		if req.syncID != tt.wantID {
+			t.Fatalf("unexpected sync id for args %v: got %q want %q", tt.args, req.syncID, tt.wantID)
+		}
+		if req.syncName != tt.wantName {
+			t.Fatalf("unexpected sync name for args %v: got %q want %q", tt.args, req.syncName, tt.wantName)
+		}
+	}
+}
+
+func TestRunSyncListAndRemove(t *testing.T) {
+	originalHome := processsync.UserHomeDirForTest()
+	home := t.TempDir()
+	processsync.SetUserHomeDirForTest(func() (string, error) { return home, nil })
+	defer processsync.SetUserHomeDirForTest(originalHome)
+
+	stdout, stderr, err := tempFiles(t)
+	if err != nil {
+		t.Fatalf("temp files: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = stdout.Close()
+		_ = stderr.Close()
+	})
+
+	code := run([]string{"--sync-register", "demo", "--read", "show {name}", "--write", "write {name}"}, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("unexpected register exit code: %d", code)
+	}
+	code = run([]string{"--sync-list"}, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("unexpected list exit code: %d", code)
+	}
+	out := readTempFile(t, stdout)
+	if !strings.Contains(out, "demo") || !strings.Contains(out, "show {name}") {
+		t.Fatalf("unexpected sync list output: %s", out)
+	}
+	stdout2, stderr2, err := tempFiles(t)
+	if err != nil {
+		t.Fatalf("temp files remove: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = stdout2.Close()
+		_ = stderr2.Close()
+	})
+	code = run([]string{"--sync-remove", "demo"}, stdout2, stderr2)
+	if code != 0 {
+		t.Fatalf("unexpected remove exit code: %d", code)
+	}
+	out = readTempFile(t, stdout2)
+	if !strings.Contains(out, "removed sync \"demo\"") {
+		t.Fatalf("unexpected sync remove output: %s", out)
 	}
 }
 
@@ -163,15 +221,15 @@ func TestRunVersionDoesNotRequireConfig(t *testing.T) {
 }
 
 func TestResolveLaunchTreatsMissingPathAsFileTarget(t *testing.T) {
-	mode, path, err := resolveLaunch([]string{"missing-file.txt"})
+	req, err := resolveLaunch([]string{"missing-file.txt"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if mode != launchFile {
-		t.Fatalf("unexpected mode: got %v want %v", mode, launchFile)
+	if req.mode != launchFile {
+		t.Fatalf("unexpected mode: got %v want %v", req.mode, launchFile)
 	}
-	if path != "missing-file.txt" {
-		t.Fatalf("unexpected path: %q", path)
+	if req.filePath != "missing-file.txt" {
+		t.Fatalf("unexpected path: %q", req.filePath)
 	}
 }
 

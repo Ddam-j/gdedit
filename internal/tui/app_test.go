@@ -10,6 +10,7 @@ import (
 
 	"gdedit/internal/agent"
 	"gdedit/internal/memo"
+	"gdedit/internal/processsync"
 	"github.com/gdamore/tcell/v2"
 )
 
@@ -1843,6 +1844,128 @@ func TestControlHubOpenCanCreateMissingFileBackedTab(t *testing.T) {
 	}
 	if len(app.tabs[app.activeTab].Content) != 1 || app.tabs[app.activeTab].Content[0] != "" {
 		t.Fatalf("unexpected missing-file tab content: %#v", app.tabs[app.activeTab].Content)
+	}
+}
+
+func TestOpenSyncCommandLoadsConfiguredSyncIntoNewTab(t *testing.T) {
+	originalHome := processsync.UserHomeDirForTest()
+	home := t.TempDir()
+	processsync.SetUserHomeDirForTest(func() (string, error) { return home, nil })
+	defer processsync.SetUserHomeDirForTest(originalHome)
+	if _, err := processsync.Register("mynamr", "mynamr rule show {name} --spec-only", "mynamr rule update {name} --spec-stdin"); err != nil {
+		t.Fatalf("register sync: %v", err)
+	}
+	originalLoad := runSyncLoad
+	defer func() { runSyncLoad = originalLoad }()
+	runSyncLoad = func(entry processsync.Entry, name string) ([]byte, []byte, error) {
+		if entry.ReadFormat != "mynamr rule show {name} --spec-only" {
+			t.Fatalf("unexpected read format: %q", entry.ReadFormat)
+		}
+		if name != "demo-rule" {
+			t.Fatalf("unexpected sync name: %q", name)
+		}
+		return []byte("kind: demo\nname: demo-rule\n"), nil, nil
+	}
+
+	app := NewScratchWithAgent("", nil, t.TempDir(), "")
+	resp, err := app.openSyncCommand("/sync mynamr demo-rule")
+	if err != nil {
+		t.Fatalf("open sync command: %v", err)
+	}
+	if resp.Message != "Opened sync mynamr:demo-rule" {
+		t.Fatalf("unexpected response message: %q", resp.Message)
+	}
+	if got := app.tabs[app.activeTab].SyncID; got != "mynamr" {
+		t.Fatalf("unexpected sync id on tab: %q", got)
+	}
+	if got := app.tabs[app.activeTab].SyncName; got != "demo-rule" {
+		t.Fatalf("unexpected sync name on tab: %q", got)
+	}
+	if got := app.tabs[app.activeTab].Title; got != "mynamr:demo-rule" {
+		t.Fatalf("unexpected tab title: %q", got)
+	}
+	if got := strings.Join(app.tabs[app.activeTab].Content, "\n"); got != "kind: demo\nname: demo-rule" {
+		t.Fatalf("unexpected rule content: %q", got)
+	}
+}
+
+func TestSaveActiveTabWritesSyncThroughStdinContract(t *testing.T) {
+	originalHome := processsync.UserHomeDirForTest()
+	home := t.TempDir()
+	processsync.SetUserHomeDirForTest(func() (string, error) { return home, nil })
+	defer processsync.SetUserHomeDirForTest(originalHome)
+	if _, err := processsync.Register("mynamr", "mynamr rule show {name} --spec-only", "mynamr rule update {name} --spec-stdin"); err != nil {
+		t.Fatalf("register sync: %v", err)
+	}
+	originalSave := runSyncSave
+	defer func() { runSyncSave = originalSave }()
+	var gotName string
+	var gotContent string
+	runSyncSave = func(entry processsync.Entry, name, content string) ([]byte, error) {
+		if entry.WriteFormat != "mynamr rule update {name} --spec-stdin" {
+			t.Fatalf("unexpected write format: %q", entry.WriteFormat)
+		}
+		gotName = name
+		gotContent = content
+		return []byte("ok"), nil
+	}
+
+	app := NewScratchWithAgent("", nil, t.TempDir(), "")
+	app.tabs = []Tab{{
+		Title:           "mynamr:demo-rule",
+		SyncID:          "mynamr",
+		SyncName:        "demo-rule",
+		Content:         []string{"kind: demo", "name: demo-rule"},
+		TrailingNewline: true,
+		Dirty:           true,
+	}}
+	app.activeTab = 0
+	app.saveActiveTab()
+
+	if gotName != "demo-rule" {
+		t.Fatalf("unexpected saved sync name: %q", gotName)
+	}
+	if gotContent != "kind: demo\nname: demo-rule\n" {
+		t.Fatalf("unexpected saved content: %q", gotContent)
+	}
+	if app.tabs[0].Dirty {
+		t.Fatal("expected rule tab dirty state to clear after save")
+	}
+	if app.statusMessage != "Saved sync mynamr:demo-rule" {
+		t.Fatalf("unexpected status message: %q", app.statusMessage)
+	}
+}
+
+func TestSaveActiveTabShowsRawSyncError(t *testing.T) {
+	originalHome := processsync.UserHomeDirForTest()
+	home := t.TempDir()
+	processsync.SetUserHomeDirForTest(func() (string, error) { return home, nil })
+	defer processsync.SetUserHomeDirForTest(originalHome)
+	if _, err := processsync.Register("mynamr", "mynamr rule show {name} --spec-only", "mynamr rule update {name} --spec-stdin"); err != nil {
+		t.Fatalf("register sync: %v", err)
+	}
+	originalSave := runSyncSave
+	defer func() { runSyncSave = originalSave }()
+	runSyncSave = func(entry processsync.Entry, name, content string) ([]byte, error) {
+		return []byte("validation failed on line 3"), errors.New("exit status 1")
+	}
+
+	app := NewScratchWithAgent("", nil, t.TempDir(), "")
+	app.tabs = []Tab{{
+		Title:    "mynamr:demo-rule",
+		SyncID:   "mynamr",
+		SyncName: "demo-rule",
+		Content:  []string{"broken: true"},
+		Dirty:    true,
+	}}
+	app.activeTab = 0
+	app.saveActiveTab()
+
+	if app.statusMessage != "validation failed on line 3" {
+		t.Fatalf("unexpected raw stderr status: %q", app.statusMessage)
+	}
+	if !app.tabs[0].Dirty {
+		t.Fatal("expected failed rule save to keep dirty state")
 	}
 }
 

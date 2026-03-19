@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"gdedit/internal/agent"
 	"gdedit/internal/config"
 	"gdedit/internal/memo"
+	"gdedit/internal/processsync"
 	sysclipboard "github.com/atotto/clipboard"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/uniseg"
@@ -37,6 +39,33 @@ const (
 
 var spinnerFrames = []string{"-", "\\", "|", "/"}
 
+var runSyncLoad = func(entry processsync.Entry, name string) ([]byte, []byte, error) {
+	command := processsync.Expand(entry.ReadFormat, name)
+	program, args := processsync.ShellCommand(command)
+	cmd := exec.Command(program, args...)
+	stdout, err := cmd.Output()
+	if err == nil {
+		return stdout, nil, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return stdout, exitErr.Stderr, err
+	}
+	return nil, []byte(err.Error()), err
+}
+
+var runSyncSave = func(entry processsync.Entry, name, content string) ([]byte, error) {
+	command := processsync.Expand(entry.WriteFormat, name)
+	program, args := processsync.ShellCommand(command)
+	cmd := exec.Command(program, args...)
+	cmd.Stdin = strings.NewReader(content)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return output, err
+	}
+	return output, nil
+}
+
 type spinnerTick struct{}
 
 type controlExecutionResult struct {
@@ -54,6 +83,8 @@ const (
 type Tab struct {
 	Title            string
 	FilePath         string
+	SyncID           string
+	SyncName         string
 	Content          []string
 	TrailingNewline  bool
 	Dirty            bool
@@ -177,6 +208,16 @@ func NewWithFiles(agentProfile string, executor agent.Executor, workspaceRoot, s
 	return app, nil
 }
 
+func NewWithSync(agentProfile string, executor agent.Executor, workspaceRoot, systemMemoRoot, syncID, syncName string) (*App, error) {
+	app := NewScratchWithAgent(agentProfile, executor, workspaceRoot, systemMemoRoot)
+	tab, err := loadTabFromSync(syncID, syncName)
+	if err != nil {
+		return nil, err
+	}
+	app.tabs = []Tab{tab}
+	return app, nil
+}
+
 func scratchTab() Tab {
 	return Tab{
 		Title:            "untitled",
@@ -285,6 +326,46 @@ func loadTabsFromPaths(filePaths []string) ([]Tab, error) {
 		})
 	}
 	return tabs, nil
+}
+
+func loadTabFromSync(syncID, syncName string) (Tab, error) {
+	trimmedID := strings.TrimSpace(syncID)
+	trimmedName := strings.TrimSpace(syncName)
+	if trimmedID == "" {
+		return Tab{}, fmt.Errorf("sync id is empty")
+	}
+	if trimmedName == "" {
+		return Tab{}, fmt.Errorf("sync name is empty")
+	}
+	entry, err := processsync.Resolve(trimmedID)
+	if err != nil {
+		return Tab{}, err
+	}
+	stdout, stderr, err := runSyncLoad(entry, trimmedName)
+	if err != nil {
+		message := strings.TrimSpace(string(stderr))
+		if message == "" {
+			message = err.Error()
+		}
+		return Tab{}, errors.New(message)
+	}
+	text := strings.ReplaceAll(string(stdout), "\r\n", "\n")
+	trailingNewline := strings.HasSuffix(text, "\n")
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	if len(lines) > 1 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return Tab{
+		Title:            trimmedID + ":" + trimmedName,
+		SyncID:           trimmedID,
+		SyncName:         trimmedName,
+		Content:          lines,
+		TrailingNewline:  trailingNewline,
+		SelectionAnchorY: -1,
+	}, nil
 }
 
 func (a *App) Run() (err error) {
@@ -995,6 +1076,9 @@ func (a *App) executePreview(input string) (agent.Response, error) {
 	if a.preview.Kind == CommandOpen {
 		return a.openFileCommand(input)
 	}
+	if a.preview.Kind == CommandSync {
+		return a.openSyncCommand(input)
+	}
 	if a.preview.Kind == CommandWrite {
 		return a.writeFileCommand(input)
 	}
@@ -1033,6 +1117,8 @@ func (a *App) beginControlExecution() {
 		a.statusMessage = "Saving memo for the current target..."
 	case CommandOpen:
 		a.statusMessage = "Opening file in a new tab..."
+	case CommandSync:
+		a.statusMessage = "Opening sync-backed buffer in a new tab..."
 	case CommandWrite:
 		a.statusMessage = "Saving file to the requested path..."
 	default:
@@ -1086,7 +1172,7 @@ func (a *App) executeAgentRequest(req agent.Request) (agent.Response, error) {
 }
 
 func (a *App) startControlExecution(input string) bool {
-	if a.screen == nil || a.preview.Kind == CommandMemo || a.preview.Kind == CommandOpen || a.preview.Kind == CommandWrite {
+	if a.screen == nil || a.preview.Kind == CommandMemo || a.preview.Kind == CommandOpen || a.preview.Kind == CommandSync || a.preview.Kind == CommandWrite {
 		a.beginControlExecution()
 		return false
 	}
@@ -1201,8 +1287,44 @@ func (a *App) openFileCommand(input string) (agent.Response, error) {
 	return agent.Response{Mode: agent.ModeMessage, Message: "Opened " + filepath.ToSlash(absPath)}, nil
 }
 
+func (a *App) openSyncCommand(input string) (agent.Response, error) {
+	syncID, syncName, ok := syncCommandPayload(input)
+	if !ok {
+		return agent.Response{}, errors.New("sync target is incomplete")
+	}
+	syncID = strings.TrimSpace(syncID)
+	syncName = strings.TrimSpace(syncName)
+	for index, tab := range a.tabs {
+		if tab.SyncID != syncID || tab.SyncName != syncName {
+			continue
+		}
+		a.saveCurrentTabState()
+		a.activeTab = index
+		a.loadCurrentTabState()
+		return agent.Response{Mode: agent.ModeMessage, Message: "Switched to sync " + syncID + ":" + syncName}, nil
+	}
+	tab, err := loadTabFromSync(syncID, syncName)
+	if err != nil {
+		return agent.Response{}, fmt.Errorf("failed to open sync target: %w", err)
+	}
+	a.saveCurrentTabState()
+	a.tabs = append(a.tabs, tab)
+	a.activeTab = len(a.tabs) - 1
+	a.loadCurrentTabState()
+	return agent.Response{Mode: agent.ModeMessage, Message: "Opened sync " + syncID + ":" + syncName}, nil
+}
+
 func (a *App) saveActiveTab() {
 	current := &a.tabs[a.activeTab]
+	if strings.TrimSpace(current.SyncID) != "" {
+		if err := a.writeSyncTab(current); err != nil {
+			a.statusMessage = err.Error()
+			return
+		}
+		current.Dirty = false
+		a.statusMessage = "Saved sync " + current.SyncID + ":" + current.SyncName
+		return
+	}
 	if strings.TrimSpace(current.FilePath) == "" {
 		a.statusMessage = "Current tab is not backed by a file. Open a file path to save changes."
 		return
@@ -1215,6 +1337,14 @@ func (a *App) saveActiveTab() {
 	a.statusMessage = "Saved " + filepath.ToSlash(current.FilePath)
 }
 
+func (a *App) serializeTabText(tab *Tab) string {
+	content := strings.Join(tab.Content, "\n")
+	if tab.TrailingNewline {
+		content += "\n"
+	}
+	return content
+}
+
 func (a *App) writeTabToPath(tab *Tab, targetPath string) error {
 	if strings.TrimSpace(targetPath) == "" {
 		return errors.New("target path is empty")
@@ -1225,16 +1355,35 @@ func (a *App) writeTabToPath(tab *Tab, targetPath string) error {
 			return err
 		}
 	}
-	content := strings.Join(tab.Content, "\n")
-	if tab.TrailingNewline {
-		content += "\n"
-	}
+	content := a.serializeTabText(tab)
 	perm := os.FileMode(0o644)
 	if info, err := os.Stat(targetPath); err == nil {
 		perm = info.Mode().Perm()
 	}
 	if err := os.WriteFile(targetPath, []byte(content), perm); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (a *App) writeSyncTab(tab *Tab) error {
+	if strings.TrimSpace(tab.SyncID) == "" {
+		return errors.New("sync id is empty")
+	}
+	if strings.TrimSpace(tab.SyncName) == "" {
+		return errors.New("sync name is empty")
+	}
+	entry, err := processsync.Resolve(tab.SyncID)
+	if err != nil {
+		return err
+	}
+	output, err := runSyncSave(entry, tab.SyncName, a.serializeTabText(tab))
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		return errors.New(message)
 	}
 	return nil
 }
@@ -2574,7 +2723,7 @@ func (a *App) drawControlPanel(x, y, width, height int) {
 		preview = "Preview: " + a.preview.Summary()
 	}
 	a.drawText(x+1, y+2, stylePreview(), trimRunes(preview, width-2))
-	footer := "Examples: /open README.md | /write notes.txt | inspect recent change"
+	footer := "Examples: /open README.md | /sync mynamr demo-rule | inspect recent change"
 	style := styleMuted()
 	if a.agentRunning {
 		footer = fmt.Sprintf("Sending %s", spinnerFrames[a.spinnerIndex])
@@ -2958,10 +3107,13 @@ func (a *App) helpLines() []string {
 		"",
 		"Control hub",
 		"  Ctrl+G           return to the editor",
-		"  Talk, inspect, /open, and /write run on Enter.",
+		"  Talk, inspect, /open, /sync, and /write run on Enter.",
 		"  Edit and memo commands preview first, then confirm on Enter.",
 		"  Example: /open README.md",
+		"  Example: /sync mynamr demo-rule",
 		"  Example: /write notes.txt",
+		"  Register syncs from the CLI with --sync-register.",
+		"  Inspect or remove them with --sync-list and --sync-remove.",
 		"  Example: /saveas \"notes with spaces.txt\"",
 		"  Example: inspect recent change",
 	}

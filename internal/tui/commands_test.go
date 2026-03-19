@@ -67,6 +67,7 @@ func TestParseAction(t *testing.T) {
 		{input: "이 파일에 해당하는 메모를 읽어서 장점을 말해줘", wantKind: CommandRoute, wantText: "resolve against active edit context"},
 		{input: "메모리 설정을 설명해줘", wantKind: CommandRoute, wantText: "resolve against active edit context"},
 		{input: "/open notes.txt", wantKind: CommandOpen, wantText: "open file in a new tab"},
+		{input: "/sync mynamr demo-rule", wantKind: CommandSync, wantText: "open sync-backed buffer in a new tab"},
 		{input: "/write notes.txt", wantKind: CommandWrite, wantText: "save current tab to path"},
 		{input: "/saveas notes.txt", wantKind: CommandWrite, wantText: "save current tab to path"},
 		{input: "안녕하세요", wantKind: CommandTalk, wantText: "talk with edit agent"},
@@ -165,6 +166,27 @@ func TestWriteCommandPayload(t *testing.T) {
 		got, ok := writeCommandPayload(test.input)
 		if ok != test.wantOK || got != test.want {
 			t.Fatalf("writeCommandPayload(%q) = (%q, %t), want (%q, %t)", test.input, got, ok, test.want, test.wantOK)
+		}
+	}
+}
+
+func TestSyncCommandPayload(t *testing.T) {
+	tests := []struct {
+		input  string
+		wantID string
+		want   string
+		wantOK bool
+	}{
+		{input: "/sync mynamr demo-rule", wantID: "mynamr", want: "demo-rule", wantOK: true},
+		{input: "/rule demo-rule", wantID: "mynamr", want: "demo-rule", wantOK: true},
+		{input: "/mynamr sample.rule", wantID: "mynamr", want: "sample.rule", wantOK: true},
+		{input: "/sync", wantID: "", want: "", wantOK: false},
+	}
+
+	for _, test := range tests {
+		gotID, got, ok := syncCommandPayload(test.input)
+		if ok != test.wantOK || got != test.want || gotID != test.wantID {
+			t.Fatalf("syncCommandPayload(%q) = (%q, %q, %t), want (%q, %q, %t)", test.input, gotID, got, ok, test.wantID, test.want, test.wantOK)
 		}
 	}
 }

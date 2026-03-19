@@ -2,16 +2,62 @@
 
 AI 에이전트를 포함한 터미널 cowork editor 프로토타입이다. WezTerm 같은 현대적인 터미널을 권장하지만, 현재 구현은 tmux/ssh 환경도 고려한 보수적인 키맵으로 정리되어 있다.
 
+## What It Is
+
+`gdedit` is an editing-first terminal editor.
+
+- Open and edit ordinary files.
+- Use the Control Hub for AI-assisted inspection, editing, memo capture, and slash commands.
+- Keep per-file conversation history with `F3`.
+- Edit external resources through subprocess sync without teaching `gdedit` the target system's schema or storage.
+
 ## Release Target
 
-- Current release target: `v0.2.0`
+- Current release target: `v0.3.0`
 - Core focus: editing-first terminal assistance, per-file Control Hub history, scoped memo routing, and release automation through GitHub Actions + GoReleaser.
 
 ## Screenshot
 
-![gdedit v0.2.0 screenshot](docs/images/gdedit-v0.2.0-history.png)
+![gdedit screenshot](docs/images/gdedit-v0.2.0-history.png)
 
 The screenshot shows the editing-first layout: active file buffer on the left, Control Hub at the bottom, Status Surface on the right, and per-file conversation history in the `F3` popup.
+
+## Quick Start
+
+### Open and edit a file
+
+```bash
+gdedit README.md
+```
+
+If the file does not exist yet, `gdedit` opens an empty file-backed tab and creates the file when you save with `Ctrl+S`.
+
+### Start with a scratch buffer
+
+```bash
+gdedit
+```
+
+### Check configuration and agent readiness
+
+```bash
+gdedit --doctor
+```
+
+### Use the Control Hub
+
+- Press `Ctrl+G` to focus the Control Hub.
+- Type natural-language requests like `inspect this file` or `메모를 추가해줘 -> -.중요 설정`.
+- Type slash commands like `/open`, `/write`, or `/sync` for direct editor actions.
+
+## Typical Workflow
+
+1. Open a file with `gdedit <file>`.
+2. Edit text normally in the main surface.
+3. Press `Ctrl+G` to move into the Control Hub.
+4. Ask for inspection, add a memo, or run a slash command.
+5. Press `Ctrl+S` to save.
+6. Press `F3` when you want to review the conversation history for the current file.
 
 ## Common Controls
 
@@ -60,10 +106,61 @@ The screenshot shows the editing-first layout: active file buffer on the left, C
 ## Slash File Commands
 
 - `/open <path>` opens an existing file in a new tab, or opens a file-backed empty tab for a missing path.
+- `/sync <id> <name>` opens a subprocess-backed sync buffer using a registered sync id.
 - `/write <path>` saves the current tab to the given path and updates the tab to that file.
 - `/saveas <path>` is an alias for `/write <path>`.
 - Quoted paths are supported, for example `/open "notes with spaces.txt"` and `/saveas "C:/Users/name/My Notes/todo.txt"`.
 - If the target file is already open, `/open` switches to the existing tab instead of duplicating it.
+
+## Process Sync
+
+- Sync registrations live in `~/.config/gdedit/process_sync.json`.
+- The goal is to let `gdedit` stay a raw text editor while external tools own loading, validation, and persistence.
+- A sync entry defines two command formats: one for reading text into the buffer and one for writing the full buffer back through stdin.
+- Use sync when the real source of truth is outside the filesystem, but the data can still be round-tripped as plain text.
+- Register a sync target from the CLI:
+
+```bash
+gdedit --sync-register mynamr --read "mynamr rule show {name} --spec-only" --write "mynamr rule update {name} --spec-stdin"
+```
+
+- List registered sync entries:
+
+```bash
+gdedit --sync-list
+```
+
+- Remove a sync entry:
+
+```bash
+gdedit --sync-remove mynamr
+```
+
+- Open a registered sync buffer from the CLI:
+
+```bash
+gdedit --sync mynamr demo-rule
+```
+
+- Open the same target from the Control Hub:
+
+```text
+/sync mynamr demo-rule
+```
+
+- `{name}` is replaced with the target name at load/save time.
+- Save still uses `Ctrl+S`; file tabs write to disk, while sync-backed tabs send the full buffer through the configured write command on stdin.
+- Recommended flow:
+  1. register one sync id with `--sync-register`
+  2. verify it with `--sync-list`
+  3. open a target via `gdedit --sync <id> <name>` or `/sync <id> <name>`
+  4. edit raw text in the buffer
+  5. press `Ctrl+S` to send the full buffer back through the write command
+
+Example use case:
+
+- `mynamr` owns the actual rule storage and validation.
+- `gdedit` just loads the raw spec into a text buffer, lets you edit it, and writes the full text back over stdin on save.
 
 ## Memo Notes
 

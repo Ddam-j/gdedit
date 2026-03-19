@@ -14,6 +14,7 @@ const (
 	CommandMemo    CommandKind = "memo"
 	CommandOpen    CommandKind = "open"
 	CommandWrite   CommandKind = "write"
+	CommandSync    CommandKind = "sync"
 	CommandSwitch  CommandKind = "switch"
 	CommandRoute   CommandKind = "route"
 )
@@ -46,7 +47,7 @@ func BuildPreview(input, scope, tab string) Preview {
 
 func commandRequiresConfirmation(kind CommandKind) bool {
 	switch kind {
-	case CommandTalk, CommandInspect, CommandOpen, CommandWrite:
+	case CommandTalk, CommandInspect, CommandOpen, CommandWrite, CommandSync:
 		return false
 	default:
 		return true
@@ -56,6 +57,9 @@ func commandRequiresConfirmation(kind CommandKind) bool {
 func parseAction(input string) (CommandKind, string) {
 	if _, ok := openCommandPayload(input); ok {
 		return CommandOpen, "open file in a new tab"
+	}
+	if _, _, ok := syncCommandPayload(input); ok {
+		return CommandSync, "open sync-backed buffer in a new tab"
 	}
 	if _, ok := writeCommandPayload(input); ok {
 		return CommandWrite, "save current tab to path"
@@ -88,6 +92,28 @@ func writeCommandPayload(input string) (string, bool) {
 		return payload, true
 	}
 	return slashPathPayload(input, "saveas")
+}
+
+func syncCommandPayload(input string) (string, string, bool) {
+	trimmed := strings.TrimSpace(input)
+	for _, command := range []string{"/sync", "/rule", "/mynamr"} {
+		if !strings.HasPrefix(strings.ToLower(trimmed), command) {
+			continue
+		}
+		payload := strings.TrimSpace(trimmed[len(command):])
+		parts := strings.Fields(payload)
+		if command == "/sync" {
+			if len(parts) < 2 {
+				return "", "", false
+			}
+			return parts[0], strings.Join(parts[1:], " "), true
+		}
+		if len(parts) < 1 {
+			return "", "", false
+		}
+		return "mynamr", strings.Join(parts, " "), true
+	}
+	return "", "", false
 }
 
 func slashPathPayload(input string, command string) (string, bool) {
